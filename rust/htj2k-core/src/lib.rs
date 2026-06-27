@@ -9,6 +9,7 @@ use wasm_bindgen::prelude::*;
 
 pub mod block_decoder;
 pub mod block_tables;
+pub mod decode;
 pub mod geometry;
 pub mod packet;
 
@@ -529,6 +530,58 @@ pub fn decode_first_codeblock(data: &[u8]) -> Result<Vec<i32>, JsError> {
     let coeffs = block_decoder::reversible_to_i32(&decoded, k_max);
 
     // Undo the DC level shift for unsigned components.
+    let shift = if comp.signed { 0 } else { 1i32 << (comp.bit_depth - 1) };
+    Ok(coeffs.iter().map(|&c| c + shift).collect())
+}
+
+/// Full reversible (lossless) decode of a single-component codestream to
+/// pixels (row-major width*height): reassembles all code-blocks into subbands
+/// (bit-exact HT entropy decode) and runs the inverse 5/3 DWT.
+///
+/// **WIP:** the inverse 5/3 DWT reconstructs the image but its boundary
+/// extension does not yet exactly match OpenJPH, so the result is bit-exact
+/// only for smooth/low-detail content; high-detail content deviates near the
+/// right/bottom edges. Matching OpenJPH's exact boundary parity is the next
+/// DWT task. The HT block decode underneath is bit-exact (see block_decoder).
+#[wasm_bindgen]
+pub fn decode_image(data: &[u8]) -> Result<Vec<i32>, JsError> {
+    let info = parse_codestream(data)?;
+    if info.kernel != WaveletKernel::Reversible53 {
+        return Err(JsError::new("decode_image currently supports the reversible 5/3 path"));
+    }
+    let comp = info.components.first().copied()
+        .ok_or_else(|| JsError::new("no components"))?;
+    let tp = info.tile_parts.first().copied()
+        .ok_or_else(|| JsError::new("no tile-parts"))?;
+    let layout = geometry::compute_component_layout(
+        0, 0, info.width as i64, info.height as i64,
+        info.num_decompositions as u32, info.code_block_width, info.code_block_height);
+    let parsed = packet::parse_packets(data, tp.data_offset as usize,
+        tp.data_length as usize, &layout, info.components.len() as u32)
+        .map_err(|e| JsError::new(&e))?;
+
+    let cbs: Vec<decode::block_decoder_input::CbInput> = parsed
+        .code_blocks
+        .iter()
+        .filter(|c| c.component == 0)
+        .map(|c| decode::block_decoder_input::CbInput {
+            resolution: c.resolution,
+            orientation: c.subband,
+            x: c.x,
+            y: c.y,
+            offset: c.offset,
+            length_cleanup: c.length_cleanup,
+            missing_msbs: c.missing_msbs,
+        })
+        .collect();
+
+    let coeffs = decode::reconstruct_reversible(
+        data, info.width, info.height, info.num_decompositions as u32,
+        info.code_block_width, info.code_block_height, info.guard_bits as u32,
+        &info.subband_exponents, &cbs,
+    )
+    .ok_or_else(|| JsError::new("reconstruction failed"))?;
+
     let shift = if comp.signed { 0 } else { 1i32 << (comp.bit_depth - 1) };
     Ok(coeffs.iter().map(|&c| c + shift).collect())
 }

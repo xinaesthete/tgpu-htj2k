@@ -366,8 +366,11 @@ pub fn decode_cleanup(
     let mmsbp2 = missing_msbs + 2;
     let sstr = (((width as u32 + 2) + 7) & !7u32) as usize;
 
-    let mut scratch = vec![0u16; sstr * (height / 2 + 2)];
-    let mut decoded = vec![0u32; stride * height];
+    // The quad scan processes ceil(height/2) quad-rows and writes both samples
+    // of each quad, so the output buffer needs an even number of rows.
+    let alloc_h = height + (height & 1);
+    let mut scratch = vec![0u16; sstr * ((height + 1) / 2 + 2)];
+    let mut decoded = vec![0u32; stride * alloc_h];
 
     // ---- Step 1: VLC + MEL -> scratch (inf, u_q per quad) ----
     {
@@ -690,6 +693,7 @@ pub fn decode_cleanup(
         }
     }
 
+    decoded.truncate(stride * height); // drop the even-alignment slack row
     Some(decoded)
 }
 
