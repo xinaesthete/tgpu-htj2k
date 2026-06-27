@@ -76,3 +76,36 @@ test("decode_image is bit-exact vs OpenJPH for smooth multi-level content", asyn
     expect(Array.from(ours)).toEqual(Array.from(ref));
   }
 });
+
+// Irreversible 9/7 (lossy) path: dequant + float inverse 9/7 DWT + level-shift.
+// Validated vs OpenJPH on high-detail content across sizes, levels, and
+// quantization strengths. The float reconstruction matches OpenJPH's scalar
+// path so closely that the round-to-integer makes the pixel output bit-exact;
+// we allow a 1-LSB tolerance for cross-platform float rounding at boundaries.
+test("decode_image matches OpenJPH for 9/7 lossy content", async () => {
+  await ensure();
+  const sizes: [number, number][] = [[8, 8], [16, 16], [9, 9], [17, 23], [33, 48]];
+  for (const quality of [undefined, 0.001, 0.01, 0.05] as const) {
+    for (const [w, h] of sizes) {
+      for (let lv = 1; lv <= Math.min(4, Math.floor(Math.log2(Math.min(w, h)))); lv++) {
+        const px = new Uint16Array(w * h);
+        let s = 1;
+        for (let i = 0; i < px.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; px[i] = s & 0x0fff; }
+        const opts: any = { data: px, width: w, height: h, components: 1, reversible: false, decompositions: lv };
+        if (quality !== undefined) opts.quality = quality;
+        const cs = await encode(opts);
+        const ours = decode_image(cs) as Int32Array;
+        const ref = (await decode(cs)).data as Uint16Array;
+        let maxd = 0, exact = 0;
+        for (let i = 0; i < ours.length; i++) {
+          const d = Math.abs(ours[i] - ref[i]);
+          if (d === 0) exact++;
+          maxd = Math.max(maxd, d);
+        }
+        const label = `q=${quality} w=${w} h=${h} lv=${lv}`;
+        expect(maxd, label).toBeLessThanOrEqual(1);
+        expect(exact / ours.length, label).toBeGreaterThanOrEqual(0.99);
+      }
+    }
+  }
+});

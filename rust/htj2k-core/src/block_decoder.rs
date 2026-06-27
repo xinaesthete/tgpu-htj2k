@@ -713,3 +713,21 @@ pub fn reversible_to_i32(decoded: &[u32], k_max: u32) -> Vec<i32> {
         })
         .collect()
 }
+
+/// Convert sign-magnitude coefficients to dequantized floats for an
+/// irreversible (9/7) subband: `coeff = ±(magnitude as f32) * delta`. `delta`
+/// must already fold the `2^-(31 - K_max)` fixed-point scale (see OpenJPH
+/// `gen_irv_tx_from_cb32` + `ojph_subband.cpp`'s `d /= 2^(31 - K_max)`).
+pub fn irreversible_to_f32(decoded: &[u32], delta: f32) -> Vec<f32> {
+    decoded
+        .iter()
+        .map(|&v| {
+            let mag = (v & 0x7FFF_FFFF) as f32 * delta;
+            if v & 0x8000_0000 != 0 {
+                -mag
+            } else {
+                mag
+            }
+        })
+        .collect()
+}

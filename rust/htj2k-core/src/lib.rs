@@ -538,17 +538,20 @@ pub fn decode_first_codeblock(data: &[u8]) -> Result<Vec<i32>, JsError> {
 /// pixels (row-major width*height): reassembles all code-blocks into subbands
 /// (bit-exact HT entropy decode) and runs the inverse 5/3 DWT.
 ///
-/// The inverse 5/3 DWT is bit-exact vs OpenJPH for high-detail content across
-/// odd / non-power-of-two / multi-level sizes (boundary extension now ports
-/// `gen_rev_horz_syn` faithfully — see `decode.rs`). The HT block decode
-/// underneath is bit-exact (see block_decoder). Not yet bit-exact for
-/// over-decomposed images (two consecutive 1×1 resolutions); see `decode.rs`.
+/// Handles both wavelet kernels:
+/// - **Reversible 5/3 (lossless):** bit-exact vs OpenJPH for high-detail content
+///   across odd / non-power-of-two / multi-level sizes (boundary extension ports
+///   `gen_rev_horz_syn` faithfully — see `decode.rs`).
+/// - **Irreversible 9/7 (lossy):** dequant + float inverse 9/7 DWT + level shift;
+///   matches OpenJPH at the pixel level across sizes, levels, and quantization
+///   strengths.
+///
+/// The HT block decode underneath is bit-exact (see block_decoder). Not yet
+/// bit-exact for over-decomposed images (two consecutive 1×1 resolutions); see
+/// `decode.rs`.
 #[wasm_bindgen]
 pub fn decode_image(data: &[u8]) -> Result<Vec<i32>, JsError> {
     let info = parse_codestream(data)?;
-    if info.kernel != WaveletKernel::Reversible53 {
-        return Err(JsError::new("decode_image currently supports the reversible 5/3 path"));
-    }
     let comp = info.components.first().copied()
         .ok_or_else(|| JsError::new("no components"))?;
     let tp = info.tile_parts.first().copied()
@@ -575,15 +578,59 @@ pub fn decode_image(data: &[u8]) -> Result<Vec<i32>, JsError> {
         })
         .collect();
 
-    let coeffs = decode::reconstruct_reversible(
-        data, info.width, info.height, info.num_decompositions as u32,
-        info.code_block_width, info.code_block_height, info.guard_bits as u32,
-        &info.subband_exponents, &cbs,
-    )
-    .ok_or_else(|| JsError::new("reconstruction failed"))?;
+    match info.kernel {
+        WaveletKernel::Reversible53 => {
+            let coeffs = decode::reconstruct_reversible(
+                data, info.width, info.height, info.num_decompositions as u32,
+                info.code_block_width, info.code_block_height, info.guard_bits as u32,
+                &info.subband_exponents, &cbs,
+            )
+            .ok_or_else(|| JsError::new("reconstruction failed"))?;
 
-    let shift = if comp.signed { 0 } else { 1i32 << (comp.bit_depth - 1) };
-    Ok(coeffs.iter().map(|&c| c + shift).collect())
+            let shift = if comp.signed { 0 } else { 1i32 << (comp.bit_depth - 1) };
+            Ok(coeffs.iter().map(|&c| c + shift).collect())
+        }
+        WaveletKernel::Irreversible97 => {
+            let coeffs = decode::reconstruct_irreversible(
+                data, info.width, info.height, info.num_decompositions as u32,
+                info.code_block_width, info.code_block_height, info.guard_bits as u32,
+                &info.subband_exponents, &info.subband_mantissas, &cbs,
+            )
+            .ok_or_else(|| JsError::new("reconstruction failed"))?;
+            Ok(irv_to_pixels(&coeffs, comp.bit_depth as u32, comp.signed))
+        }
+    }
+}
+
+/// Convert normalized irreversible (9/7) float samples to integer pixels —
+/// a port of OpenJPH `local_gen_irv_convert_to_integer`: scale by
+/// `2^bit_depth`, round half-away-from-zero, clamp to the component's dynamic
+/// range, then apply the DC level shift (`+2^(bit_depth-1)` for unsigned).
+fn irv_to_pixels(coeffs: &[f32], bit_depth: u32, signed: bool) -> Vec<i32> {
+    let mul = (1u64 << bit_depth) as f32;
+    let s32_up = i32::MAX >> (32 - bit_depth);
+    let s32_low = i32::MIN >> (32 - bit_depth);
+    let fl_up = -(s32_low as f32);
+    let fl_low = s32_low as f32;
+    let half = 1i32 << (bit_depth - 1);
+    coeffs
+        .iter()
+        .map(|&c| {
+            let t = c * mul;
+            let mut v = (t + if t >= 0.0 { 0.5 } else { -0.5 }) as i32;
+            if !(t >= fl_low) {
+                v = s32_low;
+            }
+            if !(t < fl_up) {
+                v = s32_up;
+            }
+            if signed {
+                v
+            } else {
+                v + half
+            }
+        })
+        .collect()
 }
 
 /// Debug: raw sign-magnitude output of the HT cleanup decode for the first

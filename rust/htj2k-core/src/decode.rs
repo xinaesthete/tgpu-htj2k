@@ -186,6 +186,164 @@ fn idwt_level(
     Band { w: out_w, h: out_h, data: out }
 }
 
+// ---------------------------------------------------------------------------
+// Irreversible 9/7 (lossy) inverse DWT — float analogue of the 5/3 path above.
+// Same deinterleaved/clamp/parity/swap structure (a port of OpenJPH
+// `gen_irv_horz_syn`), but float, with a K pre-scale and four lifting steps.
+// ---------------------------------------------------------------------------
+
+/// 9/7 irreversible scaling constant K and the four lifting coefficients in
+/// synthesis order (T.801 `init_irv97`).
+const IRV97_K: f32 = 1.230_174_104_914_001;
+const IRV97_STEPS: [f32; 4] = [
+    0.443_506_852_043_971,
+    0.882_911_075_530_934,
+    -0.052_980_118_572_961,
+    -1.586_134_342_059_924,
+];
+
+/// One subband's dequantized float coefficients (row-major, `w * h`).
+struct FBand {
+    w: usize,
+    h: usize,
+    data: Vec<f32>,
+}
+
+#[inline]
+fn clamp_get_f32(buf: &[f32], idx: isize, len: usize) -> f32 {
+    if len == 0 {
+        return 0.0;
+    }
+    if idx < 0 {
+        buf[0]
+    } else if idx as usize >= len {
+        buf[len - 1]
+    } else {
+        buf[idx as usize]
+    }
+}
+
+/// Inverse 1D 9/7 (irreversible) synthesis — a port of OpenJPH's
+/// `gen_irv_horz_syn`. Mirrors `idwt_1d_53` (clamp extension, origin-parity
+/// `even` flag, aug/oth swap, re-interleave) but operates on floats, applies
+/// the K pre-scale (low `*= K`, high `*= 1/K`) before lifting, and runs four
+/// `aug -= a * (l + r)` steps.
+fn idwt_1d_97(low: &[f32], high: &[f32], out: &mut [f32], even: bool) {
+    let width = low.len() + high.len();
+    if width == 0 {
+        return;
+    }
+    if width == 1 {
+        out[0] = if even { low[0] } else { high[0] * 0.5 };
+        return;
+    }
+
+    let mut aug = low.to_vec();
+    let mut oth = high.to_vec();
+    let mut aug_width = (width + if even { 1 } else { 0 }) >> 1;
+    let mut oth_width = (width + if even { 0 } else { 1 }) >> 1;
+
+    // K pre-scale on the original low/high buffers (before any swap).
+    let k_inv = 1.0f32 / IRV97_K;
+    for v in aug.iter_mut() {
+        *v *= IRV97_K;
+    }
+    for v in oth.iter_mut() {
+        *v *= k_inv;
+    }
+
+    let mut ev = even;
+    for &a in &IRV97_STEPS {
+        let off: isize = if ev { 0 } else { 1 };
+        for i in 0..aug_width {
+            let ii = i as isize + off;
+            let s = clamp_get_f32(&oth, ii - 1, oth_width) + clamp_get_f32(&oth, ii, oth_width);
+            aug[i] -= a * s;
+        }
+        std::mem::swap(&mut aug, &mut oth);
+        std::mem::swap(&mut aug_width, &mut oth_width);
+        ev = !ev;
+    }
+
+    let (lo, hi) = (&aug, &oth);
+    let mut li = 0usize;
+    let mut hi_i = 0usize;
+    let mut dp = 0usize;
+    let mut w = width;
+    if !even {
+        out[dp] = hi[hi_i];
+        dp += 1;
+        hi_i += 1;
+        w -= 1;
+    }
+    while w > 1 {
+        out[dp] = lo[li];
+        out[dp + 1] = hi[hi_i];
+        dp += 2;
+        li += 1;
+        hi_i += 1;
+        w -= 2;
+    }
+    if w == 1 {
+        out[dp] = lo[li];
+    }
+}
+
+/// Inverse one 9/7 DWT level — float analogue of `idwt_level` (horizontal then
+/// vertical, per-axis origin parity).
+fn idwt_level_f32(
+    ll: &FBand,
+    hl: &FBand,
+    lh: &FBand,
+    hh: &FBand,
+    out_w: usize,
+    out_h: usize,
+    even_x: bool,
+    even_y: bool,
+) -> FBand {
+    let rw0 = ll.w;
+    let rw1 = hl.w;
+    let rh0 = ll.h;
+    let rh1 = lh.h;
+    debug_assert_eq!(rw0 + rw1, out_w);
+    debug_assert_eq!(rh0 + rh1, out_h);
+
+    let mut a = vec![0f32; out_w * rh0];
+    let mut b = vec![0f32; out_w * rh1];
+    let mut row_out = vec![0f32; out_w];
+
+    for y in 0..rh0 {
+        let lo = &ll.data[y * rw0..y * rw0 + rw0];
+        let hi = &hl.data[y * rw1..y * rw1 + rw1];
+        idwt_1d_97(lo, hi, &mut row_out[..out_w], even_x);
+        a[y * out_w..y * out_w + out_w].copy_from_slice(&row_out[..out_w]);
+    }
+    for y in 0..rh1 {
+        let lo = &lh.data[y * rw0..y * rw0 + rw0];
+        let hi = &hh.data[y * rw1..y * rw1 + rw1];
+        idwt_1d_97(lo, hi, &mut row_out[..out_w], even_x);
+        b[y * out_w..y * out_w + out_w].copy_from_slice(&row_out[..out_w]);
+    }
+
+    let mut out = vec![0f32; out_w * out_h];
+    let mut col_low = vec![0f32; rh0.max(1)];
+    let mut col_high = vec![0f32; rh1.max(1)];
+    let mut col_out = vec![0f32; out_h];
+    for x in 0..out_w {
+        for y in 0..rh0 {
+            col_low[y] = a[y * out_w + x];
+        }
+        for y in 0..rh1 {
+            col_high[y] = b[y * out_w + x];
+        }
+        idwt_1d_97(&col_low[..rh0], &col_high[..rh1], &mut col_out[..out_h], even_y);
+        for y in 0..out_h {
+            out[y * out_w + x] = col_out[y];
+        }
+    }
+    FBand { w: out_w, h: out_h, data: out }
+}
+
 /// Reconstruct a single reversible component from its parsed code-blocks.
 /// Returns the level-shifted (pixel-domain) samples, row-major `width * height`.
 pub fn reconstruct_reversible(
@@ -290,6 +448,124 @@ pub fn reconstruct_reversible(
         let even_x = (res.x0 & 1) == 0;
         let even_y = (res.y0 & 1) == 0;
         cur = idwt_level(&cur, &hl, &lh, &hh, out_w, out_h, even_x, even_y);
+    }
+    Some(cur.data)
+}
+
+/// Quantization step size `delta` for an irreversible (9/7) subband, including
+/// the `2^-(31 - K_max)` fixed-point scale folded in — a port of OpenJPH
+/// `get_irrev_delta` (`ojph_params.cpp`) plus `ojph_subband.cpp`'s
+/// `d /= 2^(31 - K_max)`. `orient` is 0=LL, 1=HL, 2=LH, 3=HH.
+fn irrev_delta(exp: u32, mantissa: u16, orient: usize, k_max: u32) -> f32 {
+    // arr = sub-band energy gain by orientation.
+    const ARR: [f32; 4] = [1.0, 2.0, 2.0, 4.0];
+    let delta_b = ((mantissa as u32 | 0x800) as f32 * ARR[orient]) / 2048.0
+        / ((1u64 << exp) as f32);
+    delta_b / ((1u64 << (31 - k_max)) as f32)
+}
+
+/// Reconstruct a single irreversible (9/7, lossy) component from its parsed
+/// code-blocks. Returns the inverse-DWT float samples (normalized, ~[-0.5,
+/// 0.5)); the caller applies the level shift + rounding to pixel values.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_irreversible(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    num_decompositions: u32,
+    code_block_width: u32,
+    code_block_height: u32,
+    guard_bits: u32,
+    subband_exponents: &[u8],
+    subband_mantissas: &[u16],
+    code_blocks: &[block_decoder_input::CbInput],
+) -> Option<Vec<f32>> {
+    let layout = compute_component_layout(
+        0,
+        0,
+        width as i64,
+        height as i64,
+        num_decompositions,
+        code_block_width,
+        code_block_height,
+    );
+
+    let n_res = layout.resolutions.len();
+    let mut ll0: Option<FBand> = None;
+    let mut detail: Vec<[Option<FBand>; 3]> = (0..n_res).map(|_| [None, None, None]).collect();
+
+    for res in &layout.resolutions {
+        for sb in &res.subbands {
+            let band = FBand {
+                w: sb.width() as usize,
+                h: sb.height() as usize,
+                data: vec![0f32; (sb.width() * sb.height()) as usize],
+            };
+            match (res.index, sb.orientation) {
+                (0, Orientation::LL) => ll0 = Some(band),
+                (_, Orientation::HL) => detail[res.index as usize][0] = Some(band),
+                (_, Orientation::LH) => detail[res.index as usize][1] = Some(band),
+                (_, Orientation::HH) => detail[res.index as usize][2] = Some(band),
+                _ => {}
+            }
+        }
+    }
+
+    let cbw = code_block_width as usize;
+    let cbh = code_block_height as usize;
+    for cb in code_blocks {
+        let band: &mut FBand = match (cb.resolution, cb.orientation) {
+            (0, Orientation::LL) => ll0.as_mut()?,
+            (r, Orientation::HL) => detail[r as usize][0].as_mut()?,
+            (r, Orientation::LH) => detail[r as usize][1].as_mut()?,
+            (r, Orientation::HH) => detail[r as usize][2].as_mut()?,
+            _ => return None,
+        };
+        let x0 = cb.x as usize * cbw;
+        let y0 = cb.y as usize * cbh;
+        let bw = cbw.min(band.w - x0);
+        let bh = cbh.min(band.h - y0);
+
+        // K_max and quant index (identical mapping to the reversible path).
+        let sb_idx = if cb.resolution == 0 {
+            0usize
+        } else {
+            ((cb.resolution - 1) * 3) as usize
+                + match cb.orientation {
+                    Orientation::HL => 0,
+                    Orientation::LH => 1,
+                    Orientation::HH => 2,
+                    Orientation::LL => 0,
+                }
+                + 1
+        };
+        let exp = *subband_exponents.get(sb_idx).unwrap_or(&0) as u32;
+        let mantissa = *subband_mantissas.get(sb_idx).unwrap_or(&0);
+        let k_max = exp.saturating_sub(1) + guard_bits;
+        let orient = cb.orientation as usize;
+        let delta = irrev_delta(exp, mantissa, orient, k_max);
+
+        let coded = data.get(cb.offset as usize..(cb.offset + cb.length_cleanup) as usize)?;
+        let decoded = block_decoder::decode_cleanup(coded, cb.missing_msbs, cb.length_cleanup, bw as u32, bh as u32)?;
+        let coeffs = block_decoder::irreversible_to_f32(&decoded, delta);
+        for y in 0..bh {
+            for x in 0..bw {
+                band.data[(y0 + y) * band.w + (x0 + x)] = coeffs[y * bw + x];
+            }
+        }
+    }
+
+    let mut cur = ll0?;
+    for r in 1..n_res {
+        let res = &layout.resolutions[r];
+        let out_w = res.width() as usize;
+        let out_h = res.height() as usize;
+        let hl = detail[r][0].take()?;
+        let lh = detail[r][1].take()?;
+        let hh = detail[r][2].take()?;
+        let even_x = (res.x0 & 1) == 0;
+        let even_y = (res.y0 & 1) == 0;
+        cur = idwt_level_f32(&cur, &hl, &lh, &hh, out_w, out_h, even_x, even_y);
     }
     Some(cur.data)
 }
