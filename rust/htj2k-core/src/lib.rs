@@ -633,6 +633,102 @@ fn irv_to_pixels(coeffs: &[f32], bit_depth: u32, signed: bool) -> Vec<i32> {
         .collect()
 }
 
+/// GPU inverse-DWT input for the reversible (5/3) path: the decoded subband
+/// coefficients plus a flat geometry descriptor (see `decode::dwt_input_53`).
+/// The GPU runs the inverse DWT over this; the level shift is applied after.
+#[wasm_bindgen]
+pub struct DwtInput53 {
+    descriptor: Vec<u32>,
+    coeffs: Vec<i32>,
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    signed: bool,
+}
+
+#[wasm_bindgen]
+impl DwtInput53 {
+    /// Flat geometry header — `[kernel, n_levels, ll0_w, ll0_h, ll0_off]` then
+    /// 12 words per level (see `decode::dwt_input_53`).
+    #[wasm_bindgen(getter)]
+    pub fn descriptor(&self) -> Vec<u32> {
+        self.descriptor.clone()
+    }
+    /// Decoded subband coefficients, row-major per band, at the descriptor offsets.
+    #[wasm_bindgen(getter)]
+    pub fn coeffs(&self) -> Vec<i32> {
+        self.coeffs.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+    /// DC level shift to add after the inverse DWT (`0` for signed components).
+    #[wasm_bindgen(getter)]
+    pub fn level_shift(&self) -> i32 {
+        if self.signed {
+            0
+        } else {
+            1i32 << (self.bit_depth - 1)
+        }
+    }
+}
+
+/// Decode a reversible (5/3) codestream up to — but not including — the inverse
+/// DWT, returning the subband coefficients + geometry for the GPU DWT layer.
+#[wasm_bindgen]
+pub fn decode_dwt_input_53(data: &[u8]) -> Result<DwtInput53, JsError> {
+    let info = parse_codestream(data)?;
+    if info.kernel != WaveletKernel::Reversible53 {
+        return Err(JsError::new("decode_dwt_input_53 only supports the reversible 5/3 path"));
+    }
+    let comp = info.components.first().copied()
+        .ok_or_else(|| JsError::new("no components"))?;
+    let tp = info.tile_parts.first().copied()
+        .ok_or_else(|| JsError::new("no tile-parts"))?;
+    let layout = geometry::compute_component_layout(
+        0, 0, info.width as i64, info.height as i64,
+        info.num_decompositions as u32, info.code_block_width, info.code_block_height);
+    let parsed = packet::parse_packets(data, tp.data_offset as usize,
+        tp.data_length as usize, &layout, info.components.len() as u32)
+        .map_err(|e| JsError::new(&e))?;
+
+    let cbs: Vec<decode::block_decoder_input::CbInput> = parsed
+        .code_blocks
+        .iter()
+        .filter(|c| c.component == 0)
+        .map(|c| decode::block_decoder_input::CbInput {
+            resolution: c.resolution,
+            orientation: c.subband,
+            x: c.x,
+            y: c.y,
+            offset: c.offset,
+            length_cleanup: c.length_cleanup,
+            missing_msbs: c.missing_msbs,
+        })
+        .collect();
+
+    let (descriptor, coeffs) = decode::dwt_input_53(
+        data, info.width, info.height, info.num_decompositions as u32,
+        info.code_block_width, info.code_block_height, info.guard_bits as u32,
+        &info.subband_exponents, &cbs,
+    )
+    .ok_or_else(|| JsError::new("dwt input packing failed"))?;
+
+    Ok(DwtInput53 {
+        descriptor,
+        coeffs,
+        width: info.width,
+        height: info.height,
+        bit_depth: comp.bit_depth as u32,
+        signed: comp.signed,
+    })
+}
+
 /// Debug: raw sign-magnitude output of the HT cleanup decode for the first
 /// code-block, plus [missing_msbs, k_max, guard_bits, exp0] appended at the end.
 #[wasm_bindgen]

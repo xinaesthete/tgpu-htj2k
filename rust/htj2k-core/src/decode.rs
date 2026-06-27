@@ -344,9 +344,11 @@ fn idwt_level_f32(
     FBand { w: out_w, h: out_h, data: out }
 }
 
-/// Reconstruct a single reversible component from its parsed code-blocks.
-/// Returns the level-shifted (pixel-domain) samples, row-major `width * height`.
-pub fn reconstruct_reversible(
+/// Decode all code-blocks into per-(resolution, orientation) `Band`s for the
+/// reversible path: the LL base band plus `detail[r] = [HL, LH, HH]`. This is
+/// the entropy-decode + reassembly stage shared by the CPU inverse DWT and the
+/// GPU DWT input packer (`dwt_input_53`).
+fn fill_bands_53(
     data: &[u8],
     width: u32,
     height: u32,
@@ -356,7 +358,7 @@ pub fn reconstruct_reversible(
     guard_bits: u32,
     subband_exponents: &[u8],
     code_blocks: &[block_decoder_input::CbInput],
-) -> Option<Vec<i32>> {
+) -> Option<(crate::geometry::ComponentLayout, Band, Vec<[Option<Band>; 3]>)> {
     let layout = compute_component_layout(
         0,
         0,
@@ -434,9 +436,30 @@ pub fn reconstruct_reversible(
         }
     }
 
+    Some((layout, ll0?, detail))
+}
+
+/// Reconstruct a single reversible component from its parsed code-blocks.
+/// Returns the level-shifted (pixel-domain) samples, row-major `width * height`.
+pub fn reconstruct_reversible(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    num_decompositions: u32,
+    code_block_width: u32,
+    code_block_height: u32,
+    guard_bits: u32,
+    subband_exponents: &[u8],
+    code_blocks: &[block_decoder_input::CbInput],
+) -> Option<Vec<i32>> {
+    let (layout, ll0, mut detail) = fill_bands_53(
+        data, width, height, num_decompositions, code_block_width, code_block_height,
+        guard_bits, subband_exponents, code_blocks,
+    )?;
+
     // Inverse DWT from the coarsest level up.
-    let mut cur = ll0?;
-    for r in 1..n_res {
+    let mut cur = ll0;
+    for r in 1..layout.resolutions.len() {
         let res = &layout.resolutions[r];
         let out_w = res.width() as usize;
         let out_h = res.height() as usize;
@@ -450,6 +473,73 @@ pub fn reconstruct_reversible(
         cur = idwt_level(&cur, &hl, &lh, &hh, out_w, out_h, even_x, even_y);
     }
     Some(cur.data)
+}
+
+/// Per-level descriptor record length (u32 words) in the GPU DWT input header.
+pub const DWT_LEVEL_REC: usize = 12;
+
+/// Pack the reversible subband coefficients + geometry into a flat layout the
+/// GPU inverse DWT consumes, so the GPU does only the DWT (and the caller the
+/// level shift). Returns `(descriptor, coeffs)`:
+///
+/// `descriptor` (u32): `[kernel=0, n_levels, ll0_w, ll0_h, ll0_off]` followed
+/// by `n_levels` records of [`DWT_LEVEL_REC`] words for r=1..=N:
+/// `[rw0, rh0, rw1, rh1, out_w, out_h, even_x, even_y, hl_off, lh_off, hh_off, _pad]`.
+/// All `*_off` are element offsets into `coeffs` (row-major band data).
+pub fn dwt_input_53(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    num_decompositions: u32,
+    code_block_width: u32,
+    code_block_height: u32,
+    guard_bits: u32,
+    subband_exponents: &[u8],
+    code_blocks: &[block_decoder_input::CbInput],
+) -> Option<(Vec<u32>, Vec<i32>)> {
+    let (layout, ll0, mut detail) = fill_bands_53(
+        data, width, height, num_decompositions, code_block_width, code_block_height,
+        guard_bits, subband_exponents, code_blocks,
+    )?;
+
+    let n_res = layout.resolutions.len();
+    let n_levels = (n_res - 1) as u32;
+    let mut coeffs: Vec<i32> = Vec::new();
+    let mut header: Vec<u32> = vec![0, n_levels, ll0.w as u32, ll0.h as u32, 0];
+
+    // ll0 at offset 0.
+    let ll0_off = coeffs.len() as u32;
+    header[4] = ll0_off;
+    coeffs.extend_from_slice(&ll0.data);
+
+    for r in 1..n_res {
+        let res = &layout.resolutions[r];
+        let prev = &layout.resolutions[r - 1];
+        let hl = detail[r][0].take()?;
+        let lh = detail[r][1].take()?;
+        let hh = detail[r][2].take()?;
+        let hl_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&hl.data);
+        let lh_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&lh.data);
+        let hh_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&hh.data);
+        header.extend_from_slice(&[
+            prev.width(),
+            prev.height(),
+            hl.w as u32,
+            lh.h as u32,
+            res.width(),
+            res.height(),
+            ((res.x0 & 1) == 0) as u32,
+            ((res.y0 & 1) == 0) as u32,
+            hl_off,
+            lh_off,
+            hh_off,
+            0,
+        ]);
+    }
+    Some((header, coeffs))
 }
 
 /// Quantization step size `delta` for an irreversible (9/7) subband, including

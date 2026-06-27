@@ -98,7 +98,7 @@ test("decode_image matches OpenJPH for 9/7 lossy content", async () => {
         const ref = (await decode(cs)).data as Uint16Array;
         let maxd = 0, exact = 0;
         for (let i = 0; i < ours.length; i++) {
-          const d = Math.abs(ours[i] - ref[i]);
+          const d = Math.abs(ours[i]! - ref[i]!);
           if (d === 0) exact++;
           maxd = Math.max(maxd, d);
         }
