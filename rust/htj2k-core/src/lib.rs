@@ -738,6 +738,46 @@ pub fn idwt53_cpu(descriptor: &[u32], coeffs: &[i32]) -> Result<Vec<i32>, JsErro
         .ok_or_else(|| JsError::new("idwt53_cpu: malformed packed input"))
 }
 
+/// Forward (analysis) 5/3 DWT of a level-shifted image, returning the packed
+/// `(descriptor, coeffs)` the inverse path consumes — the CPU golden for the GPU
+/// forward, and the encode-direction transform. `descriptor`/`coeffs` getters
+/// match `DwtInput53`.
+#[wasm_bindgen]
+pub struct ForwardDwt53 {
+    descriptor: Vec<u32>,
+    coeffs: Vec<i32>,
+}
+
+#[wasm_bindgen]
+impl ForwardDwt53 {
+    #[wasm_bindgen(getter)]
+    pub fn descriptor(&self) -> Vec<u32> {
+        self.descriptor.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn coeffs(&self) -> Vec<i32> {
+        self.coeffs.clone()
+    }
+}
+
+/// Forward 5/3 DWT: `samples` are the level-shifted image (row-major
+/// `width * height`). Returns subband coefficients packed for the inverse path.
+#[wasm_bindgen]
+pub fn dwt_forward_53(
+    samples: &[i32],
+    width: u32,
+    height: u32,
+    num_decompositions: u32,
+    code_block_width: u32,
+    code_block_height: u32,
+) -> Result<ForwardDwt53, JsError> {
+    let (descriptor, coeffs) = decode::dwt_forward_53(
+        samples, width, height, num_decompositions, code_block_width, code_block_height,
+    )
+    .ok_or_else(|| JsError::new("dwt_forward_53: bad input (size mismatch?)"))?;
+    Ok(ForwardDwt53 { descriptor, coeffs })
+}
+
 /// GPU inverse-DWT input for the irreversible (9/7) path: dequantized float
 /// subband coefficients + the same geometry descriptor as `DwtInput53`
 /// (kernel = 1). The GPU runs the float inverse 9/7 DWT; the caller converts

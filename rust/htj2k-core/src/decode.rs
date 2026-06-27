@@ -571,6 +571,178 @@ pub fn idwt53_from_packed(descriptor: &[u32], coeffs: &[i32]) -> Option<Vec<i32>
     Some(cur.data)
 }
 
+// ---------------------------------------------------------------------------
+// Forward (analysis) 5/3 DWT — the encode-direction transform, and a reusable
+// primitive in its own right. Exact inverse of the synthesis above: it
+// decomposes a spatial image into LL + per-level (HL, LH, HH) subbands in the
+// same packed layout the inverse consumes, so forward → inverse is identity and
+// forward output is bit-exact vs OpenJPH's analysis.
+// ---------------------------------------------------------------------------
+
+/// Forward 1D 5/3 analysis — exact inverse of `idwt_1d_53`. Splits a spatial
+/// line `x` into deinterleaved low/high subband samples (clamp extension,
+/// origin-parity `even`). Predict then update (reverse of the synthesis order).
+fn fwd_1d_53(x: &[i32], even: bool) -> (Vec<i32>, Vec<i32>) {
+    let width = x.len();
+    let nl = (width + if even { 1 } else { 0 }) >> 1;
+    let nh = (width + if even { 0 } else { 1 }) >> 1;
+    let mut low = vec![0i32; nl];
+    let mut high = vec![0i32; nh];
+    if width == 0 {
+        return (low, high);
+    }
+    if width == 1 {
+        if even {
+            low[0] = x[0];
+        } else {
+            high[0] = x[0] << 1;
+        }
+        return (low, high);
+    }
+    // Deinterleave: low samples sit at the parity-`even` positions.
+    let low_phase = if even { 0usize } else { 1 };
+    for p in 0..width {
+        let idx = p >> 1;
+        if (p & 1) == low_phase {
+            low[idx] = x[p];
+        } else {
+            high[idx] = x[p];
+        }
+    }
+    // Predict (analysis): high[i] -= (low[i+off-1] + low[i+off]) >> 1.
+    let offp: isize = if even { 1 } else { 0 };
+    for i in 0..nh {
+        let ii = i as isize + offp;
+        let s = clamp_get(&low, ii - 1, nl) + clamp_get(&low, ii, nl);
+        high[i] -= s >> 1;
+    }
+    // Update (analysis): low[i] += (2 + high[i+off-1] + high[i+off]) >> 2.
+    let offu: isize = if even { 0 } else { 1 };
+    for i in 0..nl {
+        let ii = i as isize + offu;
+        let s = clamp_get(&high, ii - 1, nh) + clamp_get(&high, ii, nh);
+        low[i] += (2 + s) >> 2;
+    }
+    (low, high)
+}
+
+/// Forward one 5/3 level: split an image band into (LL, HL, LH, HH). Vertical
+/// analysis first, then horizontal — the reverse of `idwt_level`'s order.
+#[allow(clippy::too_many_arguments)]
+fn fwd_level_53(
+    input: &Band,
+    rw0: usize,
+    rh0: usize,
+    rw1: usize,
+    rh1: usize,
+    even_x: bool,
+    even_y: bool,
+) -> (Band, Band, Band, Band) {
+    let w = input.w;
+    let h = input.h;
+    debug_assert_eq!(rw0 + rw1, w);
+    debug_assert_eq!(rh0 + rh1, h);
+
+    // Vertical analysis: each column → low (rh0 rows, A) + high (rh1 rows, B).
+    let mut a = vec![0i32; w * rh0];
+    let mut b = vec![0i32; w * rh1];
+    let mut col = vec![0i32; h];
+    for x in 0..w {
+        for y in 0..h {
+            col[y] = input.data[y * w + x];
+        }
+        let (lo, hi) = fwd_1d_53(&col, even_y);
+        for y in 0..rh0 {
+            a[y * w + x] = lo[y];
+        }
+        for y in 0..rh1 {
+            b[y * w + x] = hi[y];
+        }
+    }
+
+    // Horizontal analysis: A rows → LL + HL; B rows → LH + HH.
+    let mut ll = vec![0i32; rw0 * rh0];
+    let mut hl = vec![0i32; rw1 * rh0];
+    let mut lh = vec![0i32; rw0 * rh1];
+    let mut hh = vec![0i32; rw1 * rh1];
+    for y in 0..rh0 {
+        let (lo, hi) = fwd_1d_53(&a[y * w..y * w + w], even_x);
+        ll[y * rw0..y * rw0 + rw0].copy_from_slice(&lo[..rw0]);
+        hl[y * rw1..y * rw1 + rw1].copy_from_slice(&hi[..rw1]);
+    }
+    for y in 0..rh1 {
+        let (lo, hi) = fwd_1d_53(&b[y * w..y * w + w], even_x);
+        lh[y * rw0..y * rw0 + rw0].copy_from_slice(&lo[..rw0]);
+        hh[y * rw1..y * rw1 + rw1].copy_from_slice(&hi[..rw1]);
+    }
+    (
+        Band { w: rw0, h: rh0, data: ll },
+        Band { w: rw1, h: rh0, data: hl },
+        Band { w: rw0, h: rh1, data: lh },
+        Band { w: rw1, h: rh1, data: hh },
+    )
+}
+
+/// Forward 5/3 DWT of a full (level-shifted) image → packed `(descriptor,
+/// coeffs)` in the same layout `dwt_input_53` / `idwt53_from_packed` consume, so
+/// `dwt_forward_53` then `idwt53_from_packed` is the identity. Decomposes
+/// finest→coarsest; the running LL feeds the next (coarser) level.
+pub fn dwt_forward_53(
+    samples: &[i32],
+    width: u32,
+    height: u32,
+    num_decompositions: u32,
+    code_block_width: u32,
+    code_block_height: u32,
+) -> Option<(Vec<u32>, Vec<i32>)> {
+    let layout = compute_component_layout(
+        0, 0, width as i64, height as i64, num_decompositions, code_block_width, code_block_height,
+    );
+    let n_res = layout.resolutions.len();
+    let top = layout.resolutions.last()?;
+    let (w, h) = (top.width() as usize, top.height() as usize);
+    if samples.len() != w * h {
+        return None;
+    }
+
+    let mut cur = Band { w, h, data: samples.to_vec() };
+    let mut detail: Vec<Option<(Band, Band, Band)>> = (0..n_res).map(|_| None).collect();
+    for r in (1..n_res).rev() {
+        let res = &layout.resolutions[r];
+        let prev = &layout.resolutions[r - 1];
+        let rw0 = prev.width() as usize;
+        let rh0 = prev.height() as usize;
+        let rw1 = res.width() as usize - rw0;
+        let rh1 = res.height() as usize - rh0;
+        let even_x = (res.x0 & 1) == 0;
+        let even_y = (res.y0 & 1) == 0;
+        let (ll, hl, lh, hh) = fwd_level_53(&cur, rw0, rh0, rw1, rh1, even_x, even_y);
+        detail[r] = Some((hl, lh, hh));
+        cur = ll;
+    }
+
+    let n_levels = (n_res - 1) as u32;
+    let mut coeffs: Vec<i32> = Vec::new();
+    let mut header: Vec<u32> = vec![0, n_levels, cur.w as u32, cur.h as u32, 0];
+    coeffs.extend_from_slice(&cur.data); // ll0 at offset 0
+    for r in 1..n_res {
+        let res = &layout.resolutions[r];
+        let prev = &layout.resolutions[r - 1];
+        let (hl, lh, hh) = detail[r].take()?;
+        let hl_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&hl.data);
+        let lh_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&lh.data);
+        let hh_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&hh.data);
+        header.extend_from_slice(&[
+            prev.width(), prev.height(), hl.w as u32, lh.h as u32, res.width(), res.height(),
+            ((res.x0 & 1) == 0) as u32, ((res.y0 & 1) == 0) as u32, hl_off, lh_off, hh_off, 0,
+        ]);
+    }
+    Some((header, coeffs))
+}
+
 /// Quantization step size `delta` for an irreversible (9/7) subband, including
 /// the `2^-(31 - K_max)` fixed-point scale folded in — a port of OpenJPH
 /// `get_irrev_delta` (`ojph_params.cpp`) plus `ojph_subband.cpp`'s
@@ -772,64 +944,7 @@ pub fn dwt_input_97(
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_get, idwt_1d_53};
-
-    /// Forward 5/3 analysis — the exact inverse of `idwt_1d_53` for a given
-    /// `even` parity. Deinterleaves `x` into the (already-lifted) low/high
-    /// samples present at even/odd output positions, then undoes the predict
-    /// and update lifting steps with the same clamp extension.
-    fn fwd_1d_53(x: &[i32], even: bool) -> (Vec<i32>, Vec<i32>) {
-        let width = x.len();
-        let nl = (width + if even { 1 } else { 0 }) >> 1;
-        let nh = (width + if even { 0 } else { 1 }) >> 1;
-        if width == 1 {
-            return if even {
-                (vec![x[0]], vec![])
-            } else {
-                (vec![], vec![x[0] << 1])
-            };
-        }
-        // Deinterleave: low/high are the lifted samples as they appear in x.
-        let mut low = vec![0i32; nl];
-        let mut high = vec![0i32; nh];
-        {
-            let mut li = 0;
-            let mut hi = 0;
-            let mut dp = 0;
-            if !even {
-                high[hi] = x[dp];
-                hi += 1;
-                dp += 1;
-            }
-            while dp + 1 < width {
-                low[li] = x[dp];
-                high[hi] = x[dp + 1];
-                li += 1;
-                hi += 1;
-                dp += 2;
-            }
-            if dp < width {
-                low[li] = x[dp];
-            }
-        }
-        // Undo predict (step1: synthesis added `s >> 1`), then undo update
-        // (step0: synthesis subtracted `(2 + s) >> 2`). Reverse order, with the
-        // same aug/oth roles: predict acts on `high` reading `low`; update acts
-        // on `low` reading `high`.
-        let off_predict: isize = if even { 1 } else { 0 }; // ev after one swap
-        for i in 0..nh {
-            let ii = i as isize + off_predict;
-            let s = clamp_get(&low, ii - 1, nl) + clamp_get(&low, ii, nl);
-            high[i] -= s >> 1;
-        }
-        let off_update: isize = if even { 0 } else { 1 };
-        for i in 0..nl {
-            let ii = i as isize + off_update;
-            let s = clamp_get(&high, ii - 1, nh) + clamp_get(&high, ii, nh);
-            low[i] += (2 + s) >> 2;
-        }
-        (low, high)
-    }
+    use super::{dwt_forward_53, fwd_1d_53, idwt53_from_packed, idwt_1d_53};
 
     #[test]
     fn idwt_level_1x1_passthrough() {
@@ -851,6 +966,21 @@ mod tests {
                 let mut out = vec![0i32; n];
                 idwt_1d_53(&low, &high, &mut out, even);
                 assert_eq!(out, x, "round-trip failed for length {} even={}", n, even);
+            }
+        }
+    }
+
+    #[test]
+    fn dwt_forward_then_inverse_is_identity() {
+        // Full 2D forward (analysis) → inverse (synthesis) round-trips exactly,
+        // across odd / non-square sizes and multiple levels.
+        for &(w, h) in &[(8usize, 8usize), (9, 9), (17, 23), (32, 32), (33, 48)] {
+            let max_lv = (w.min(h) as f64).log2().floor() as u32;
+            for lv in 1..=max_lv.min(4) {
+                let img: Vec<i32> = (0..(w * h) as i32).map(|i| (i * 37 + 11) % 4096 - 2048).collect();
+                let (desc, coeffs) = dwt_forward_53(&img, w as u32, h as u32, lv, 64, 64).unwrap();
+                let back = idwt53_from_packed(&desc, &coeffs).unwrap();
+                assert_eq!(back, img, "round-trip failed w={} h={} lv={}", w, h, lv);
             }
         }
     }
