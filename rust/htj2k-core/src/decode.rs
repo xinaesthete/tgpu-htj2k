@@ -558,7 +558,8 @@ fn irrev_delta(exp: u32, mantissa: u16, orient: usize, k_max: u32) -> f32 {
 /// code-blocks. Returns the inverse-DWT float samples (normalized, ~[-0.5,
 /// 0.5)); the caller applies the level shift + rounding to pixel values.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_irreversible(
+#[allow(clippy::too_many_arguments)]
+fn fill_bands_97(
     data: &[u8],
     width: u32,
     height: u32,
@@ -569,7 +570,7 @@ pub fn reconstruct_irreversible(
     subband_exponents: &[u8],
     subband_mantissas: &[u16],
     code_blocks: &[block_decoder_input::CbInput],
-) -> Option<Vec<f32>> {
+) -> Option<(crate::geometry::ComponentLayout, FBand, Vec<[Option<FBand>; 3]>)> {
     let layout = compute_component_layout(
         0,
         0,
@@ -645,8 +646,29 @@ pub fn reconstruct_irreversible(
         }
     }
 
-    let mut cur = ll0?;
-    for r in 1..n_res {
+    Some((layout, ll0?, detail))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_irreversible(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    num_decompositions: u32,
+    code_block_width: u32,
+    code_block_height: u32,
+    guard_bits: u32,
+    subband_exponents: &[u8],
+    subband_mantissas: &[u16],
+    code_blocks: &[block_decoder_input::CbInput],
+) -> Option<Vec<f32>> {
+    let (layout, ll0, mut detail) = fill_bands_97(
+        data, width, height, num_decompositions, code_block_width, code_block_height,
+        guard_bits, subband_exponents, subband_mantissas, code_blocks,
+    )?;
+
+    let mut cur = ll0;
+    for r in 1..layout.resolutions.len() {
         let res = &layout.resolutions[r];
         let out_w = res.width() as usize;
         let out_h = res.height() as usize;
@@ -658,6 +680,65 @@ pub fn reconstruct_irreversible(
         cur = idwt_level_f32(&cur, &hl, &lh, &hh, out_w, out_h, even_x, even_y);
     }
     Some(cur.data)
+}
+
+/// Pack the irreversible (dequantized float) subband coefficients + geometry
+/// for the GPU inverse 9/7 DWT — same descriptor layout as `dwt_input_53`
+/// (kernel = 1), with `coeffs` as f32.
+#[allow(clippy::too_many_arguments)]
+pub fn dwt_input_97(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    num_decompositions: u32,
+    code_block_width: u32,
+    code_block_height: u32,
+    guard_bits: u32,
+    subband_exponents: &[u8],
+    subband_mantissas: &[u16],
+    code_blocks: &[block_decoder_input::CbInput],
+) -> Option<(Vec<u32>, Vec<f32>)> {
+    let (layout, ll0, mut detail) = fill_bands_97(
+        data, width, height, num_decompositions, code_block_width, code_block_height,
+        guard_bits, subband_exponents, subband_mantissas, code_blocks,
+    )?;
+
+    let n_res = layout.resolutions.len();
+    let n_levels = (n_res - 1) as u32;
+    let mut coeffs: Vec<f32> = Vec::new();
+    let mut header: Vec<u32> = vec![1, n_levels, ll0.w as u32, ll0.h as u32, 0];
+
+    header[4] = coeffs.len() as u32;
+    coeffs.extend_from_slice(&ll0.data);
+
+    for r in 1..n_res {
+        let res = &layout.resolutions[r];
+        let prev = &layout.resolutions[r - 1];
+        let hl = detail[r][0].take()?;
+        let lh = detail[r][1].take()?;
+        let hh = detail[r][2].take()?;
+        let hl_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&hl.data);
+        let lh_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&lh.data);
+        let hh_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&hh.data);
+        header.extend_from_slice(&[
+            prev.width(),
+            prev.height(),
+            hl.w as u32,
+            lh.h as u32,
+            res.width(),
+            res.height(),
+            ((res.x0 & 1) == 0) as u32,
+            ((res.y0 & 1) == 0) as u32,
+            hl_off,
+            lh_off,
+            hh_off,
+            0,
+        ]);
+    }
+    Some((header, coeffs))
 }
 
 #[cfg(test)]

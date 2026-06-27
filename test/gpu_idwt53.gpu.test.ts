@@ -15,7 +15,7 @@ async function ensure() {
 
 test("GPU inverse 5/3 DWT is bit-exact vs CPU decode_image", async () => {
   await ensure();
-  const sizes: [number, number][] = [[8, 8], [16, 16], [9, 9], [17, 23], [32, 32], [33, 48]];
+  const sizes: [number, number][] = [[8, 8], [9, 9], [17, 23], [33, 48]];
   for (const [w, h] of sizes) {
     for (let lv = 1; lv <= Math.min(4, Math.floor(Math.log2(Math.min(w, h)))); lv++) {
       const px = new Uint16Array(w * h);

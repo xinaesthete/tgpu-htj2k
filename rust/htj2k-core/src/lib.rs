@@ -729,6 +729,100 @@ pub fn decode_dwt_input_53(data: &[u8]) -> Result<DwtInput53, JsError> {
     })
 }
 
+/// GPU inverse-DWT input for the irreversible (9/7) path: dequantized float
+/// subband coefficients + the same geometry descriptor as `DwtInput53`
+/// (kernel = 1). The GPU runs the float inverse 9/7 DWT; the caller converts
+/// the normalized samples to pixels (see `irv_to_pixels` / `DwtInput97` fields).
+#[wasm_bindgen]
+pub struct DwtInput97 {
+    descriptor: Vec<u32>,
+    coeffs: Vec<f32>,
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    signed: bool,
+}
+
+#[wasm_bindgen]
+impl DwtInput97 {
+    #[wasm_bindgen(getter)]
+    pub fn descriptor(&self) -> Vec<u32> {
+        self.descriptor.clone()
+    }
+    /// Dequantized subband coefficients (f32), row-major per band at the offsets.
+    #[wasm_bindgen(getter)]
+    pub fn coeffs(&self) -> Vec<f32> {
+        self.coeffs.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+    #[wasm_bindgen(getter)]
+    pub fn bit_depth(&self) -> u32 {
+        self.bit_depth
+    }
+    #[wasm_bindgen(getter)]
+    pub fn signed(&self) -> bool {
+        self.signed
+    }
+}
+
+/// Decode an irreversible (9/7) codestream up to — but not including — the
+/// inverse DWT, returning dequantized float subbands + geometry for the GPU.
+#[wasm_bindgen]
+pub fn decode_dwt_input_97(data: &[u8]) -> Result<DwtInput97, JsError> {
+    let info = parse_codestream(data)?;
+    if info.kernel != WaveletKernel::Irreversible97 {
+        return Err(JsError::new("decode_dwt_input_97 only supports the irreversible 9/7 path"));
+    }
+    let comp = info.components.first().copied()
+        .ok_or_else(|| JsError::new("no components"))?;
+    let tp = info.tile_parts.first().copied()
+        .ok_or_else(|| JsError::new("no tile-parts"))?;
+    let layout = geometry::compute_component_layout(
+        0, 0, info.width as i64, info.height as i64,
+        info.num_decompositions as u32, info.code_block_width, info.code_block_height);
+    let parsed = packet::parse_packets(data, tp.data_offset as usize,
+        tp.data_length as usize, &layout, info.components.len() as u32)
+        .map_err(|e| JsError::new(&e))?;
+
+    let cbs: Vec<decode::block_decoder_input::CbInput> = parsed
+        .code_blocks
+        .iter()
+        .filter(|c| c.component == 0)
+        .map(|c| decode::block_decoder_input::CbInput {
+            resolution: c.resolution,
+            orientation: c.subband,
+            x: c.x,
+            y: c.y,
+            offset: c.offset,
+            length_cleanup: c.length_cleanup,
+            missing_msbs: c.missing_msbs,
+        })
+        .collect();
+
+    let (descriptor, coeffs) = decode::dwt_input_97(
+        data, info.width, info.height, info.num_decompositions as u32,
+        info.code_block_width, info.code_block_height, info.guard_bits as u32,
+        &info.subband_exponents, &info.subband_mantissas, &cbs,
+    )
+    .ok_or_else(|| JsError::new("dwt input packing failed"))?;
+
+    Ok(DwtInput97 {
+        descriptor,
+        coeffs,
+        width: info.width,
+        height: info.height,
+        bit_depth: comp.bit_depth as u32,
+        signed: comp.signed,
+    })
+}
+
 /// Debug: raw sign-magnitude output of the HT cleanup decode for the first
 /// code-block, plus [missing_msbs, k_max, guard_bits, exp0] appended at the end.
 #[wasm_bindgen]
