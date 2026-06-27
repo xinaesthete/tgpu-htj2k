@@ -542,6 +542,35 @@ pub fn dwt_input_53(
     Some((header, coeffs))
 }
 
+/// Run *only* the inverse 5/3 DWT on a packed `(descriptor, coeffs)` pair
+/// (as produced by `dwt_input_53`). This is the CPU counterpart of the GPU
+/// `idwt53Gpu` over identical input — used to benchmark the DWT stage in
+/// isolation from entropy decode.
+pub fn idwt53_from_packed(descriptor: &[u32], coeffs: &[i32]) -> Option<Vec<i32>> {
+    let n_levels = *descriptor.get(1)? as usize;
+    let ll0_w = *descriptor.get(2)? as usize;
+    let ll0_h = *descriptor.get(3)? as usize;
+    let ll0_off = *descriptor.get(4)? as usize;
+    let mut cur = Band {
+        w: ll0_w,
+        h: ll0_h,
+        data: coeffs.get(ll0_off..ll0_off + ll0_w * ll0_h)?.to_vec(),
+    };
+    for lvl in 0..n_levels {
+        let o = 5 + lvl * DWT_LEVEL_REC;
+        let rec = descriptor.get(o..o + DWT_LEVEL_REC)?;
+        let (rw0, rh0, rw1, rh1) = (rec[0] as usize, rec[1] as usize, rec[2] as usize, rec[3] as usize);
+        let (out_w, out_h) = (rec[4] as usize, rec[5] as usize);
+        let (even_x, even_y) = (rec[6] == 1, rec[7] == 1);
+        let (hl_off, lh_off, hh_off) = (rec[8] as usize, rec[9] as usize, rec[10] as usize);
+        let hl = Band { w: rw1, h: rh0, data: coeffs.get(hl_off..hl_off + rw1 * rh0)?.to_vec() };
+        let lh = Band { w: rw0, h: rh1, data: coeffs.get(lh_off..lh_off + rw0 * rh1)?.to_vec() };
+        let hh = Band { w: rw1, h: rh1, data: coeffs.get(hh_off..hh_off + rw1 * rh1)?.to_vec() };
+        cur = idwt_level(&cur, &hl, &lh, &hh, out_w, out_h, even_x, even_y);
+    }
+    Some(cur.data)
+}
+
 /// Quantization step size `delta` for an irreversible (9/7) subband, including
 /// the `2^-(31 - K_max)` fixed-point scale folded in — a port of OpenJPH
 /// `get_irrev_delta` (`ojph_params.cpp`) plus `ojph_subband.cpp`'s

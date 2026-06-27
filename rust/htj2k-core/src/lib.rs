@@ -729,6 +729,15 @@ pub fn decode_dwt_input_53(data: &[u8]) -> Result<DwtInput53, JsError> {
     })
 }
 
+/// Run only the CPU inverse 5/3 DWT on a packed `(descriptor, coeffs)` pair
+/// (from `DwtInput53`). The CPU counterpart of `idwt53Gpu`, for benchmarking the
+/// DWT stage in isolation from entropy decode.
+#[wasm_bindgen]
+pub fn idwt53_cpu(descriptor: &[u32], coeffs: &[i32]) -> Result<Vec<i32>, JsError> {
+    decode::idwt53_from_packed(descriptor, coeffs)
+        .ok_or_else(|| JsError::new("idwt53_cpu: malformed packed input"))
+}
+
 /// GPU inverse-DWT input for the irreversible (9/7) path: dequantized float
 /// subband coefficients + the same geometry descriptor as `DwtInput53`
 /// (kernel = 1). The GPU runs the float inverse 9/7 DWT; the caller converts
