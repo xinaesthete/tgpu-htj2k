@@ -10,24 +10,20 @@
 // Per level: horizontal pass (LL+HL → A low-vertical rows, LH+HH → B
 // high-vertical rows, packed in `hbuf`), then vertical pass (A+B per column →
 // output). Levels run coarse→fine in a JS loop, ping-ponging `inbuf`/`outbuf`.
+//
+// The uniform struct (`Lvl`) and bind group layout (`layout0`) are typed
+// TypeGPU resources generated from the WGSL by tgpu-gen (see `idwt53.gen.ts`);
+// the compute logic below references them as externals and is stitched together
+// by `tgpu.resolveWithContext`, so the struct/binding declarations live only in
+// TypeScript (single source of truth, type-checked buffers and bind groups).
 import tgpu from "typegpu";
 import * as d from "typegpu/data";
 import { getDevice } from "./device";
+import { Lvl, layout0 } from "./idwt53.gen";
 
-const WGSL = /* wgsl */ `
-struct Lvl {
-  rw0: u32, rh0: u32, rw1: u32, rh1: u32,
-  out_w: u32, out_h: u32, even_x: u32, even_y: u32,
-  hl_off: u32, lh_off: u32, hh_off: u32, _pad: u32,
-};
-
-@group(0) @binding(0) var<uniform> L: Lvl;
-@group(0) @binding(1) var<storage, read>        inbuf:  array<i32>; // LL input (rw0 x rh0)
-@group(0) @binding(2) var<storage, read>        coeffs: array<i32>; // HL/LH/HH
-@group(0) @binding(3) var<storage, read_write>  hbuf:   array<i32>; // horiz out: A then B
-@group(0) @binding(4) var<storage, read_write>  outbuf: array<i32>; // vert out
-@group(0) @binding(5) var<storage, read_write>  scratch: array<i32>;
-
+// Compute logic only — `L`, `inbuf`, `coeffs`, `hbuf`, `outbuf`, `scratch` and
+// the `Lvl` struct are injected by tgpu.resolveWithContext from `layout0`.
+const TEMPLATE = /* wgsl */ `
 fn clampr(j: i32, n: u32) -> u32 {
   if (j < 0) { return 0u; }
   if (u32(j) >= n) { return n - 1u; }
@@ -90,7 +86,6 @@ fn idwt_h(@builtin(global_invocation_id) gid: vec3u) {
 
   let nl = L.rw0; let nh = L.rw1; let width = L.out_w;
   let base = ry * L.out_w;        // scratch region for this row
-  // Choose source rows: A (ry<rh0) from LL(inbuf)+HL; B from LH+HH.
   var low_is_inbuf = false;
   var low_off: u32 = 0u; var high_off: u32 = 0u; var srow: u32 = 0u;
   var a_size = L.rh0 * L.out_w;   // hbuf offset where B rows begin
@@ -101,22 +96,18 @@ fn idwt_h(@builtin(global_invocation_id) gid: vec3u) {
     srow = ry - L.rh0;
     low_off = L.lh_off + srow * L.rw0; high_off = L.hh_off + srow * L.rw1;
   }
-  // copy low/high into scratch
   for (var i: u32 = 0u; i < nl; i = i + 1u) {
     scratch[base + i] = select(coeffs[low_off + i], inbuf[low_off + i], low_is_inbuf);
   }
   for (var i: u32 = 0u; i < nh; i = i + 1u) {
     scratch[base + nl + i] = coeffs[high_off + i];
   }
+  let out_base = select(a_size + srow * L.out_w, ry * L.out_w, ry < L.rh0);
   if (width == 1u) {
-    let v = select(scratch[base + nl], scratch[base], L.even_x == 1u);
-    let dst = select(a_size + srow * L.out_w, ry * L.out_w, ry < L.rh0) + 0u;
-    hbuf[dst] = v;
+    hbuf[out_base] = select(scratch[base + nl], scratch[base], L.even_x == 1u);
     return;
   }
   lift(base, nl, nh, L.even_x);
-  // write row into hbuf (stride 1, buffer sel 0)
-  var out_base = select(a_size + srow * L.out_w, ry * L.out_w, ry < L.rh0);
   interleave(base, nl, nh, L.even_x, out_base, 1u);
 }
 
@@ -139,7 +130,6 @@ fn idwt_v(@builtin(global_invocation_id) gid: vec3u) {
     return;
   }
   lift(base, nl, nh, L.even_y);
-  // write column into outbuf with stride out_w and buffer sel 1 (high bit set).
   interleave(base, nl, nh, L.even_y, cx, L.out_w | 0x80000000u);
 }
 `;
@@ -155,36 +145,33 @@ export interface DwtInput53 {
 // per device. (Re-creating modules/pipelines every call also churns the Dawn
 // native addon, which destabilises its process-exit teardown under Node.)
 interface Pipe {
+  root: ReturnType<typeof tgpu.initFromDevice>;
   device: GPUDevice;
-  bgl: GPUBindGroupLayout;
   pipeH: GPUComputePipeline;
   pipeV: GPUComputePipeline;
-  paramsBuf: GPUBuffer;
 }
 let pipeCache: Promise<Pipe> | undefined;
 
 async function getPipe(): Promise<Pipe> {
   pipeCache ??= (async () => {
     const device = await getDevice();
-    const module = device.createShaderModule({ code: WGSL });
-    // Explicit layout so every binding is present for both entry points (auto
-    // layout prunes bindings a given entry point doesn't statically touch).
-    const storage = (i: number): GPUBindGroupLayoutEntry => ({
-      binding: i, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" as const },
+    const root = tgpu.initFromDevice({ device });
+    // Stitch the compute logic together with the generated struct + bind group
+    // layout; `code` carries the injected declarations, and `usedBindGroupLayouts`
+    // gives the layouts in @group order for the pipeline layout.
+    const { code, usedBindGroupLayouts } = tgpu.resolveWithContext({
+      template: TEMPLATE,
+      // `Lvl` is pulled in automatically as a dependency of the `L` binding.
+      externals: { ...layout0.bound },
+      names: "strict",
     });
-    const bgl = device.createBindGroupLayout({
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" as const } },
-        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" as const } },
-        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" as const } },
-        storage(3), storage(4), storage(5),
-      ],
+    const module = device.createShaderModule({ code });
+    const pipeLayout = device.createPipelineLayout({
+      bindGroupLayouts: usedBindGroupLayouts.map((l) => root.unwrap(l)),
     });
-    const pipeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
     const pipeH = device.createComputePipeline({ layout: pipeLayout, compute: { module, entryPoint: "idwt_h" } });
     const pipeV = device.createComputePipeline({ layout: pipeLayout, compute: { module, entryPoint: "idwt_v" } });
-    const paramsBuf = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    return { device, bgl, pipeH, pipeV, paramsBuf };
+    return { root, device, pipeH, pipeV };
   })();
   return pipeCache;
 }
@@ -192,23 +179,22 @@ async function getPipe(): Promise<Pipe> {
 /** Run the inverse 5/3 DWT on the GPU. Returns the reconstructed coefficients
  *  (before level shift), row-major `width * height`. */
 export async function idwt53Gpu(input: DwtInput53): Promise<Int32Array> {
-  const { device, bgl, pipeH, pipeV, paramsBuf } = await getPipe();
-  const root = tgpu.initFromDevice({ device });
+  const { root, device, pipeH, pipeV } = await getPipe();
   const { descriptor: desc, coeffs, width, height } = input;
-  // Descriptor is a well-formed flat header (see decode::dwt_input_53); reads
-  // are in-bounds by construction, so assert non-null past noUncheckedIndexedAccess.
   const at = (i: number): number => desc[i]!;
   const nLevels = at(1);
   const imgN = width * height;
 
-  // Per-call buffers (image-sized i32 storage). ll0 dims:
+  // Typed per-call buffers.
   const ll0w = at(2), ll0h = at(3), ll0off = at(4);
-  const coeffBuf = root.createBuffer(d.arrayOf(d.i32, Math.max(1, coeffs.length)), Array.from(coeffs)).$usage("storage");
-  let inbuf = root.createBuffer(d.arrayOf(d.i32, Math.max(1, imgN))).$usage("storage");
-  let outbuf = root.createBuffer(d.arrayOf(d.i32, Math.max(1, imgN))).$usage("storage");
-  const hbuf = root.createBuffer(d.arrayOf(d.i32, Math.max(1, imgN))).$usage("storage");
-  const scratch = root.createBuffer(d.arrayOf(d.i32, Math.max(1, imgN))).$usage("storage");
-  const owned = [coeffBuf, inbuf, outbuf, hbuf, scratch];
+  const arr = (n: number) => d.arrayOf(d.i32, Math.max(1, n));
+  const coeffBuf = root.createBuffer(arr(coeffs.length), Array.from(coeffs)).$usage("storage");
+  let inbuf = root.createBuffer(arr(imgN)).$usage("storage");
+  let outbuf = root.createBuffer(arr(imgN)).$usage("storage");
+  const hbuf = root.createBuffer(arr(imgN)).$usage("storage");
+  const scratch = root.createBuffer(arr(imgN)).$usage("storage");
+  const lvlBuf = root.createBuffer(Lvl).$usage("uniform");
+  const owned = [coeffBuf, inbuf, outbuf, hbuf, scratch, lvlBuf];
 
   // Seed inbuf with ll0.
   inbuf.write(Array.from(coeffs.subarray(ll0off, ll0off + ll0w * ll0h)).concat(
@@ -216,34 +202,30 @@ export async function idwt53Gpu(input: DwtInput53): Promise<Int32Array> {
 
   for (let lvl = 0; lvl < nLevels; lvl++) {
     const o = 5 + lvl * 12;
-    const rec = desc.subarray(o, o + 12);
     const outW = at(o + 4);
     const rowCount = at(o + 1) + at(o + 3); // rh0 + rh1
-    device.queue.writeBuffer(paramsBuf, 0, new Uint32Array(rec));
+    lvlBuf.write({
+      rw0: at(o), rh0: at(o + 1), rw1: at(o + 2), rh1: at(o + 3),
+      out_w: at(o + 4), out_h: at(o + 5), even_x: at(o + 6), even_y: at(o + 7),
+      hl_off: at(o + 8), lh_off: at(o + 9), hh_off: at(o + 10), _pad: 0,
+    });
 
-    const gpuIn = root.unwrap(inbuf), gpuOut = root.unwrap(outbuf);
-    const entries = [
-      { binding: 0, resource: { buffer: paramsBuf } },
-      { binding: 1, resource: { buffer: gpuIn } },
-      { binding: 2, resource: { buffer: root.unwrap(coeffBuf) } },
-      { binding: 3, resource: { buffer: root.unwrap(hbuf) } },
-      { binding: 4, resource: { buffer: gpuOut } },
-      { binding: 5, resource: { buffer: root.unwrap(scratch) } },
-    ];
-    const bind = device.createBindGroup({ layout: bgl, entries });
+    const bind = root.createBindGroup(layout0, {
+      L: lvlBuf, inbuf, coeffs: coeffBuf, hbuf, outbuf, scratch,
+    });
+    const rawBind = root.unwrap(bind);
 
     const enc = device.createCommandEncoder();
     const ph = enc.beginComputePass();
-    ph.setPipeline(pipeH); ph.setBindGroup(0, bind);
+    ph.setPipeline(pipeH); ph.setBindGroup(0, rawBind);
     ph.dispatchWorkgroups(Math.ceil(rowCount / 64));
     ph.end();
     const pv = enc.beginComputePass();
-    pv.setPipeline(pipeV); pv.setBindGroup(0, bind);
+    pv.setPipeline(pipeV); pv.setBindGroup(0, rawBind);
     pv.dispatchWorkgroups(Math.ceil(outW / 64));
     pv.end();
     device.queue.submit([enc.finish()]);
 
-    // outbuf now holds this level's reconstruction; it becomes the next LL.
     [inbuf, outbuf] = [outbuf, inbuf];
   }
 
