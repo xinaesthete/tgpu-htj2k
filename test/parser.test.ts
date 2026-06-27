@@ -34,6 +34,11 @@ test("parses geometry of a single-component HTJ2K codestream from OpenJPH", asyn
   expect(info.component_bit_depth(0)).toBe(16);
   expect(info.component_is_signed(0)).toBe(false);
   expect(info.is_htj2k).toBe(true);
+
+  // QCD: reversible => no quantization; dyadic subband count = 1 + 3·decompositions.
+  expect(info.quant_style).toBe(0);
+  expect(info.guard_bits).toBeGreaterThanOrEqual(1);
+  expect(info.num_quant_subbands).toBe(1 + 3 * info.num_decompositions);
   info.free();
 });
 

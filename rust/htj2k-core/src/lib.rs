@@ -55,6 +55,11 @@ pub struct CodestreamInfo {
     num_layers: u16,
     mct: bool,
     is_htj2k: bool,
+    // QCD (quantization defaults)
+    quant_style: u8,
+    guard_bits: u8,
+    subband_exponents: Vec<u8>,
+    subband_mantissas: Vec<u16>,
 }
 
 /// Cursor over a big-endian byte slice with bounds-checked reads.
@@ -156,6 +161,33 @@ impl CodestreamInfo {
     pub fn is_htj2k(&self) -> bool {
         self.is_htj2k
     }
+    /// Quantization style: 0 = none (reversible), 1 = scalar derived, 2 = scalar expounded.
+    #[wasm_bindgen(getter)]
+    pub fn quant_style(&self) -> u8 {
+        self.quant_style
+    }
+    #[wasm_bindgen(getter)]
+    pub fn guard_bits(&self) -> u8 {
+        self.guard_bits
+    }
+    /// Number of subbands described by QCD (1 + 3·decompositions for dyadic).
+    #[wasm_bindgen(getter)]
+    pub fn num_quant_subbands(&self) -> u32 {
+        self.subband_exponents.len() as u32
+    }
+
+    /// Quantization exponent (ε) of subband `idx` (0 = LL of the coarsest level).
+    pub fn subband_exponent(&self, idx: u32) -> Result<u8, JsError> {
+        self.subband_exponents
+            .get(idx as usize)
+            .copied()
+            .ok_or_else(|| JsError::new("subband index out of range"))
+    }
+
+    /// Quantization mantissa (μ) of subband `idx` (0 for reversible).
+    pub fn subband_mantissa(&self, idx: u32) -> u16 {
+        self.subband_mantissas.get(idx as usize).copied().unwrap_or(0)
+    }
 
     /// Bit depth of component `idx` (0-based).
     pub fn component_bit_depth(&self, idx: u32) -> Result<u8, JsError> {
@@ -201,6 +233,10 @@ pub fn parse_codestream(data: &[u8]) -> Result<CodestreamInfo, JsError> {
         num_layers: 0,
         mct: false,
         is_htj2k: false,
+        quant_style: 0,
+        guard_bits: 0,
+        subband_exponents: Vec::new(),
+        subband_mantissas: Vec::new(),
     };
     let mut seen_siz = false;
     let mut seen_cod = false;
@@ -267,9 +303,26 @@ pub fn parse_codestream(data: &[u8]) -> Result<CodestreamInfo, JsError> {
                 seen_cod = true;
             }
             markers::QCD => {
-                // Quantization defaults — needed for 9/7 dequant later. Skip for now.
                 let lqcd = r.u16()? as usize;
-                r.skip(lqcd - 2)?;
+                let seg_end = r.pos + lqcd - 2;
+                let sqcd = r.u8()?;
+                info.quant_style = sqcd & 0x1F;
+                info.guard_bits = sqcd >> 5;
+                if info.quant_style == 0 {
+                    // No quantization (reversible): one byte per subband, exponent in top 5 bits.
+                    while r.pos < seg_end {
+                        let b = r.u8()?;
+                        info.subband_exponents.push(b >> 3);
+                    }
+                } else {
+                    // Scalar derived (1) or expounded (2): 16 bits per entry (5-bit exp, 11-bit mantissa).
+                    while r.pos + 2 <= seg_end {
+                        let v = r.u16()?;
+                        info.subband_exponents.push((v >> 11) as u8);
+                        info.subband_mantissas.push(v & 0x07FF);
+                    }
+                }
+                r.pos = seg_end;
             }
             _ => {
                 // Any other marker segment carries a 2-byte length we can skip.
