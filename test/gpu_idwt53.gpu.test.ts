@@ -26,14 +26,15 @@ test("GPU inverse 5/3 DWT is bit-exact vs CPU decode_image", async () => {
       const cpu = decode_image(cs) as Int32Array;
 
       const inp = decode_dwt_input_53(cs);
-      const shift = inp.level_shift;
-      const gpuCoeffs = (await idwt53Gpu({
+      // The GPU folds the level shift into its output, so it should equal
+      // decode_image directly (no CPU post-pass).
+      const gpu = (await idwt53Gpu({
         descriptor: inp.descriptor,
         coeffs: inp.coeffs,
         width: inp.width,
         height: inp.height,
+        shift: inp.level_shift,
       }))!;
-      const gpu = Int32Array.from(gpuCoeffs, (c) => c + shift);
 
       let mismatches = 0, first = "";
       for (let i = 0; i < cpu.length; i++) {

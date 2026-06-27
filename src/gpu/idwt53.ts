@@ -1,11 +1,11 @@
 // GPU inverse 5/3 (reversible) DWT — the TypeGPU/WebGPU port of the CPU
 // `idwt_level` in `rust/htj2k-core/src/decode.rs`, used as the golden reference.
 //
-// Strategy: one GPU thread per DWT line. The 5/3 lifting is sequential *along*
-// a line (each step reads its neighbours), but lines are independent, so we
-// parallelise over rows (horizontal pass) and columns (vertical pass). Each
-// thread runs the exact deinterleaved/clamp/parity/swap synthesis the CPU does,
-// in i32 (WGSL `>>` on i32 is an arithmetic shift), so the result is bit-exact.
+// Strategy: one workgroup per DWT line, lifting in workgroup shared memory with
+// intra-line parallelism (see the kernel comment below). The 5/3 lifting runs in
+// i32 (WGSL `>>` on i32 is an arithmetic shift), so the result is bit-exact vs
+// the CPU. The vertical pass folds in the DC level shift, so the GPU emits
+// display-ready pixels (no CPU post-pass).
 //
 // Per level: horizontal pass (LL+HL → A low-vertical rows, LH+HH → B
 // high-vertical rows, packed in `hbuf`), then vertical pass (A+B per column →
@@ -62,8 +62,9 @@ fn lift(t: u32, nl: u32, nh: u32, even: u32) {
 }
 
 // Interleave shared low/high into out[out_base + p*out_stride], parallel over p.
-// sel: 0 -> hbuf, 1 -> outbuf.
-fn scatter(t: u32, nl: u32, nh: u32, even: u32, out_base: u32, out_stride: u32, sel: u32) {
+// sel: 0 -> hbuf, 1 -> outbuf. shift (DC level shift) is added on the final
+// output so the GPU emits display-ready pixels; 0 for intermediate writes.
+fn scatter(t: u32, nl: u32, nh: u32, even: u32, out_base: u32, out_stride: u32, sel: u32, shift: i32) {
   let width = nl + nh;
   let low_phase = select(1u, 0u, even == 1u); // low samples sit at this output parity
   for (var p: u32 = t; p < width; p = p + ${WG}u) {
@@ -71,7 +72,7 @@ fn scatter(t: u32, nl: u32, nh: u32, even: u32, out_base: u32, out_stride: u32, 
     var v: i32;
     if ((p & 1u) == low_phase) { v = sh[idx]; } else { v = sh[nl + idx]; }
     let o = out_base + p * out_stride;
-    if (sel == 0u) { hbuf[o] = v; } else { outbuf[o] = v; }
+    if (sel == 0u) { hbuf[o] = v; } else { outbuf[o] = v + shift; }
   }
 }
 
@@ -105,7 +106,7 @@ fn idwt_h(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: 
     return;
   }
   lift(t, nl, nh, L.even_x);
-  scatter(t, nl, nh, L.even_x, out_base, 1u, 0u);
+  scatter(t, nl, nh, L.even_x, out_base, 1u, 0u, 0i); // hbuf is intermediate: no shift
 }
 
 // ---- Vertical pass: one workgroup per output column ----
@@ -124,11 +125,11 @@ fn idwt_v(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: 
   }
   workgroupBarrier();
   if (height == 1u) {
-    if (t == 0u) { outbuf[cx] = select(sh[nl], sh[0], L.even_y == 1u); }
+    if (t == 0u) { outbuf[cx] = select(sh[nl], sh[0], L.even_y == 1u) + i32(L.shift); }
     return;
   }
   lift(t, nl, nh, L.even_y);
-  scatter(t, nl, nh, L.even_y, cx, L.out_w, 1u);
+  scatter(t, nl, nh, L.even_y, cx, L.out_w, 1u, i32(L.shift)); // final output: + level shift
 }
 `;
 
@@ -137,6 +138,9 @@ export interface DwtInput53 {
   coeffs: Int32Array;
   width: number;
   height: number;
+  /** DC level shift to add on the final level (the GPU emits display-ready
+   *  pixels). 0 for signed components. Defaults to 0. */
+  shift?: number;
 }
 
 // Pipeline state is expensive to build and immutable across calls, so cache it
@@ -213,6 +217,7 @@ export interface Idwt53Opts {
 export async function idwt53Gpu(input: DwtInput53, opts: Idwt53Opts = {}): Promise<Int32Array | null> {
   const { root, device, pipeH, pipeV } = await getPipe();
   const { descriptor: desc, coeffs, width, height } = input;
+  const shift = input.shift ?? 0;
   const at = (i: number): number => desc[i]!;
   const nLevels = at(1);
   const imgN = width * height;
@@ -232,7 +237,8 @@ export async function idwt53Gpu(input: DwtInput53, opts: Idwt53Opts = {}): Promi
     p.lvlBuf.write({
       rw0: at(o), rh0: at(o + 1), rw1: at(o + 2), rh1: at(o + 3),
       out_w: at(o + 4), out_h: at(o + 5), even_x: at(o + 6), even_y: at(o + 7),
-      hl_off: at(o + 8), lh_off: at(o + 9), hh_off: at(o + 10), _pad: 0,
+      hl_off: at(o + 8), lh_off: at(o + 9), hh_off: at(o + 10),
+      shift: lvl === nLevels - 1 ? shift : 0,
     });
     const rawBind = root.unwrap(root.createBindGroup(layout0, {
       L: p.lvlBuf, inbuf, coeffs: p.coeffBuf, hbuf: p.hbuf, outbuf,

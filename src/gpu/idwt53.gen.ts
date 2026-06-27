@@ -19,7 +19,10 @@ export const Lvl = d.struct({
   hl_off: d.u32,
   lh_off: d.u32,
   hh_off: d.u32,
-  _pad: d.u32,
+  // DC level shift to add on the final level's output (0 on other levels and
+  // for signed components) — reuses the former padding slot. The vertical pass
+  // adds it so the GPU emits display-ready pixels (no CPU post-pass).
+  shift: d.u32,
 });
 
 /* bindGroupLayouts */
