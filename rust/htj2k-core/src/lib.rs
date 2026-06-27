@@ -538,11 +538,11 @@ pub fn decode_first_codeblock(data: &[u8]) -> Result<Vec<i32>, JsError> {
 /// pixels (row-major width*height): reassembles all code-blocks into subbands
 /// (bit-exact HT entropy decode) and runs the inverse 5/3 DWT.
 ///
-/// **WIP:** the inverse 5/3 DWT reconstructs the image but its boundary
-/// extension does not yet exactly match OpenJPH, so the result is bit-exact
-/// only for smooth/low-detail content; high-detail content deviates near the
-/// right/bottom edges. Matching OpenJPH's exact boundary parity is the next
-/// DWT task. The HT block decode underneath is bit-exact (see block_decoder).
+/// The inverse 5/3 DWT is bit-exact vs OpenJPH for high-detail content across
+/// odd / non-power-of-two / multi-level sizes (boundary extension now ports
+/// `gen_rev_horz_syn` faithfully — see `decode.rs`). The HT block decode
+/// underneath is bit-exact (see block_decoder). Not yet bit-exact for
+/// over-decomposed images (two consecutive 1×1 resolutions); see `decode.rs`.
 #[wasm_bindgen]
 pub fn decode_image(data: &[u8]) -> Result<Vec<i32>, JsError> {
     let info = parse_codestream(data)?;

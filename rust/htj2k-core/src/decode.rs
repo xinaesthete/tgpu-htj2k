@@ -1,8 +1,18 @@
 //! Full single-component decode: reassemble code-blocks into subbands and run
 //! the inverse 5/3 (reversible) DWT to reconstruct the image. Lossless path.
 //!
-//! The inverse 5/3 lifting matches OpenJPH (predict: `+= (l+r) >> 1`,
-//! update: `-= (2 + l + r) >> 2`) with whole-sample symmetric extension.
+//! The inverse 5/3 DWT is a faithful port of OpenJPH's `gen_rev_horz_syn`
+//! (`ojph_transform.cpp`): deinterleaved low/high buffers, per-step **clamp**
+//! (replicate) boundary extension, an origin-parity `even` flag, and the
+//! aug/oth buffer swap. Pass order is horizontal-then-vertical to match
+//! `resolution::pull_line`. Bit-exact vs OpenJPH for high-detail content across
+//! odd / non-power-of-two / multi-level sizes (see `test/decode.test.ts`).
+//!
+//! Known limitation: *over-decomposed* images — more decomposition levels than
+//! the image naturally supports, which produces two consecutive 1×1
+//! resolutions — are not yet bit-exact. The DWT itself is correct there (the
+//! 1×1 passthrough is unit-tested); the gap is upstream code-block coverage at
+//! those degenerate resolutions. Realistic encoders never over-decompose.
 
 use crate::block_decoder;
 use crate::geometry::{compute_component_layout, Orientation};
@@ -14,60 +24,121 @@ struct Band {
     data: Vec<i32>,
 }
 
-/// Whole-sample symmetric mirror of index `i` into `[0, n)`.
-fn mirror(mut i: isize, n: isize) -> usize {
-    if n == 1 {
+/// Clamp (replicate) read of `buf[idx]` into `[0, len)` — OpenJPH extends the
+/// deinterleaved high/low buffers by replicating the edge sample (`oth[-1] =
+/// oth[0]`, `oth[len] = oth[len-1]`), *not* by whole-sample mirroring.
+#[inline]
+fn clamp_get(buf: &[i32], idx: isize, len: usize) -> i32 {
+    if len == 0 {
         return 0;
     }
-    loop {
-        if i < 0 {
-            i = -i;
-        } else if i >= n {
-            i = 2 * (n - 1) - i;
-        } else {
-            return i as usize;
-        }
+    if idx < 0 {
+        buf[0]
+    } else if idx as usize >= len {
+        buf[len - 1]
+    } else {
+        buf[idx as usize]
     }
 }
 
-/// Inverse 1D 5/3 synthesis (interleaved, whole-sample symmetric extension).
-/// Bit-exact vs OpenJPH for power-of-two-friendly subband sizes; see the
-/// known-limitation note in `decode_image` for arbitrary non-power-of-two
-/// dimensions, whose boundary parity OpenJPH handles differently.
-fn idwt_1d_53(low: &[i32], high: &[i32], out: &mut [i32]) {
-    let nl = low.len();
-    let nh = high.len();
-    let n = nl + nh;
-    if n == 0 {
+/// Inverse 1D 5/3 (reversible) synthesis — a faithful port of OpenJPH's
+/// `gen_rev_horz_syn32` (`ojph_transform.cpp`). Used for both the horizontal
+/// (row) and vertical (column) passes, since the 1D math is identical.
+///
+/// `low`/`high` are the deinterleaved low-pass / high-pass subband samples.
+/// `even` is the parity of this resolution's coordinate origin on the canvas
+/// (`(org & 1) == 0`): when `true` the first reconstructed sample (`out[0]`) is
+/// a low-pass sample, otherwise it is a high-pass sample. This parity — skipped
+/// in the earlier mirror-based version — is what makes the boundary extension
+/// match OpenJPH for odd dimensions and non-even origins.
+///
+/// The two 5/3 synthesis lifting steps (T.801 `init_rev53`) are applied on the
+/// deinterleaved buffers with per-step clamp extension and an aug/oth buffer
+/// swap, exactly as OpenJPH does, then the result is re-interleaved into `out`.
+/// Integer `>>` is an arithmetic (floor) shift, matching OpenJPH's signed `>>`.
+fn idwt_1d_53(low: &[i32], high: &[i32], out: &mut [i32], even: bool) {
+    let width = low.len() + high.len();
+    if width == 0 {
         return;
     }
-    if n == 1 {
-        out[0] = if nl == 1 { low[0] } else { high[0] };
+    if width == 1 {
+        // OpenJPH: lone sample — low passes through, lone high is halved.
+        out[0] = if even { low[0] } else { high[0] >> 1 };
         return;
     }
-    for k in 0..n {
-        out[k] = if k & 1 == 0 { low[k / 2] } else { high[k / 2] };
+
+    // `aug` starts as the low-pass buffer, `oth` as the high-pass buffer.
+    let mut aug = low.to_vec();
+    let mut oth = high.to_vec();
+    let mut aug_width = (width + if even { 1 } else { 0 }) >> 1; // low-pass count
+    let mut oth_width = (width + if even { 0 } else { 1 }) >> 1; // high-pass count
+    let mut ev = even;
+
+    // 5/3 reversible synthesis steps: (A=1, B=2, E=2) update, then
+    // (A=-1, B=1, E=1) predict. `synthesis` direction per gen_rev_vert_step.
+    for &(a, b, e) in &[(1i32, 2i32, 2u32), (-1i32, 1i32, 1u32)] {
+        let off: isize = if ev { 0 } else { 1 };
+        for i in 0..aug_width {
+            let ii = i as isize + off;
+            let s = clamp_get(&oth, ii - 1, oth_width) + clamp_get(&oth, ii, oth_width);
+            if a == 1 {
+                aug[i] -= (b + s) >> e; // update (synthesis subtracts)
+            } else {
+                aug[i] += s >> e; // 5/3 predict (a=-1, b=1, e=1)
+            }
+        }
+        std::mem::swap(&mut aug, &mut oth);
+        std::mem::swap(&mut aug_width, &mut oth_width);
+        ev = !ev;
     }
-    let ni = n as isize;
-    let mut k = 0;
-    while k < n {
-        let left = out[mirror(k as isize - 1, ni)];
-        let right = out[mirror(k as isize + 1, ni)];
-        out[k] -= (left + right + 2).div_euclid(4);
-        k += 2;
+    // Two swaps later, `aug` holds the final low samples, `oth` the final high.
+
+    // Re-interleave: a leading lone high sample when the origin is odd, then
+    // alternating low/high, then a trailing lone low sample.
+    let (lo, hi) = (&aug, &oth);
+    let mut li = 0usize;
+    let mut hi_i = 0usize;
+    let mut dp = 0usize;
+    let mut w = width;
+    if !even {
+        out[dp] = hi[hi_i];
+        dp += 1;
+        hi_i += 1;
+        w -= 1;
     }
-    let mut k = 1;
-    while k < n {
-        let left = out[k - 1];
-        let right = out[mirror(k as isize + 1, ni)];
-        out[k] += (left + right).div_euclid(2);
-        k += 2;
+    while w > 1 {
+        out[dp] = lo[li];
+        out[dp + 1] = hi[hi_i];
+        dp += 2;
+        li += 1;
+        hi_i += 1;
+        w -= 2;
+    }
+    if w == 1 {
+        out[dp] = lo[li];
     }
 }
 
 /// Inverse one DWT level: combine `ll` (low-low) with detail bands `hl`, `lh`,
 /// `hh` into a reconstructed band of size `out_w * out_h`.
-fn idwt_level(ll: &Band, hl: &Band, lh: &Band, hh: &Band, out_w: usize, out_h: usize) -> Band {
+///
+/// Order matches OpenJPH's `resolution::pull_line`: **horizontal first, then
+/// vertical**. Integer 5/3 lifting does not commute, so the pass order must be
+/// the reference's to stay bit-exact across decomposition levels.
+///
+/// `even_x`/`even_y` are the parity of this resolution's canvas origin
+/// (`(org & 1) == 0`), threaded into the 1D synthesis so boundary extension
+/// matches OpenJPH (see `idwt_1d_53`).
+fn idwt_level(
+    ll: &Band,
+    hl: &Band,
+    lh: &Band,
+    hh: &Band,
+    out_w: usize,
+    out_h: usize,
+    even_x: bool,
+    even_y: bool,
+) -> Band {
     let rw0 = ll.w; // low horizontal width  (== lh.w)
     let rw1 = hl.w; // high horizontal width (== hh.w)
     let rh0 = ll.h; // low vertical height   (== hl.h)
@@ -75,47 +146,42 @@ fn idwt_level(ll: &Band, hl: &Band, lh: &Band, hh: &Band, out_w: usize, out_h: u
     debug_assert_eq!(rw0 + rw1, out_w);
     debug_assert_eq!(rh0 + rh1, out_h);
 
-    // Vertical inverse: A = combine(LL, LH) per column (width rw0, height out_h);
-    //                   B = combine(HL, HH) per column (width rw1, height out_h).
-    let mut a = vec![0i32; rw0 * out_h];
-    let mut b = vec![0i32; rw1 * out_h];
+    // Horizontal inverse first:
+    //   A = combine(LL, HL) per row → vertically-low, full-width rows  (rh0 × out_w)
+    //   B = combine(LH, HH) per row → vertically-high, full-width rows (rh1 × out_w)
+    let mut a = vec![0i32; out_w * rh0];
+    let mut b = vec![0i32; out_w * rh1];
+    let mut row_out = vec![0i32; out_w];
+
+    for y in 0..rh0 {
+        let lo = &ll.data[y * rw0..y * rw0 + rw0];
+        let hi = &hl.data[y * rw1..y * rw1 + rw1];
+        idwt_1d_53(lo, hi, &mut row_out[..out_w], even_x);
+        a[y * out_w..y * out_w + out_w].copy_from_slice(&row_out[..out_w]);
+    }
+    for y in 0..rh1 {
+        let lo = &lh.data[y * rw0..y * rw0 + rw0];
+        let hi = &hh.data[y * rw1..y * rw1 + rw1];
+        idwt_1d_53(lo, hi, &mut row_out[..out_w], even_x);
+        b[y * out_w..y * out_w + out_w].copy_from_slice(&row_out[..out_w]);
+    }
+
+    // Vertical inverse: combine A (low) and B (high) per column → output.
+    let mut out = vec![0i32; out_w * out_h];
     let mut col_low = vec![0i32; rh0.max(1)];
     let mut col_high = vec![0i32; rh1.max(1)];
     let mut col_out = vec![0i32; out_h];
-
-    for x in 0..rw0 {
+    for x in 0..out_w {
         for y in 0..rh0 {
-            col_low[y] = ll.data[y * rw0 + x];
+            col_low[y] = a[y * out_w + x];
         }
         for y in 0..rh1 {
-            col_high[y] = lh.data[y * rw0 + x];
+            col_high[y] = b[y * out_w + x];
         }
-        idwt_1d_53(&col_low[..rh0], &col_high[..rh1], &mut col_out[..out_h]);
+        idwt_1d_53(&col_low[..rh0], &col_high[..rh1], &mut col_out[..out_h], even_y);
         for y in 0..out_h {
-            a[y * rw0 + x] = col_out[y];
+            out[y * out_w + x] = col_out[y];
         }
-    }
-    for x in 0..rw1 {
-        for y in 0..rh0 {
-            col_low[y] = hl.data[y * rw1 + x];
-        }
-        for y in 0..rh1 {
-            col_high[y] = hh.data[y * rw1 + x];
-        }
-        idwt_1d_53(&col_low[..rh0], &col_high[..rh1], &mut col_out[..out_h]);
-        for y in 0..out_h {
-            b[y * rw1 + x] = col_out[y];
-        }
-    }
-
-    // Horizontal inverse: combine A (low) and B (high) per row → output.
-    let mut out = vec![0i32; out_w * out_h];
-    let mut row_out = vec![0i32; out_w];
-    for y in 0..out_h {
-        let lo = &a[y * rw0..y * rw0 + rw0];
-        let hi = &b[y * rw1..y * rw1 + rw1];
-        idwt_1d_53(lo, hi, &mut row_out[..out_w]);
-        out[y * out_w..y * out_w + out_w].copy_from_slice(&row_out[..out_w]);
     }
     Band { w: out_w, h: out_h, data: out }
 }
@@ -219,52 +285,97 @@ pub fn reconstruct_reversible(
         let hl = detail[r][0].take()?;
         let lh = detail[r][1].take()?;
         let hh = detail[r][2].take()?;
-        cur = idwt_level(&cur, &hl, &lh, &hh, out_w, out_h);
+        // Boundary parity: whether this resolution's canvas origin is even
+        // (OpenJPH `horz_even = (org.x & 1) == 0`, `vert_even = (org.y & 1) == 0`).
+        let even_x = (res.x0 & 1) == 0;
+        let even_y = (res.y0 & 1) == 0;
+        cur = idwt_level(&cur, &hl, &lh, &hh, out_w, out_h, even_x, even_y);
     }
     Some(cur.data)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::idwt_1d_53;
+    use super::{clamp_get, idwt_1d_53};
 
-    use super::mirror;
-
-    // Forward 5/3 analysis (interleaved, whole-sample symmetric) for round-trip.
-    fn fwd_1d_53(x: &[i32]) -> (Vec<i32>, Vec<i32>) {
-        let n = x.len();
-        let mut t = x.to_vec();
-        if n >= 2 {
-            let ni = n as isize;
-            let mut k = 1;
-            while k < n {
-                let right = t[mirror(k as isize + 1, ni)];
-                t[k] -= (t[k - 1] + right).div_euclid(2);
-                k += 2;
+    /// Forward 5/3 analysis — the exact inverse of `idwt_1d_53` for a given
+    /// `even` parity. Deinterleaves `x` into the (already-lifted) low/high
+    /// samples present at even/odd output positions, then undoes the predict
+    /// and update lifting steps with the same clamp extension.
+    fn fwd_1d_53(x: &[i32], even: bool) -> (Vec<i32>, Vec<i32>) {
+        let width = x.len();
+        let nl = (width + if even { 1 } else { 0 }) >> 1;
+        let nh = (width + if even { 0 } else { 1 }) >> 1;
+        if width == 1 {
+            return if even {
+                (vec![x[0]], vec![])
+            } else {
+                (vec![], vec![x[0] << 1])
+            };
+        }
+        // Deinterleave: low/high are the lifted samples as they appear in x.
+        let mut low = vec![0i32; nl];
+        let mut high = vec![0i32; nh];
+        {
+            let mut li = 0;
+            let mut hi = 0;
+            let mut dp = 0;
+            if !even {
+                high[hi] = x[dp];
+                hi += 1;
+                dp += 1;
             }
-            let mut k = 0;
-            while k < n {
-                let left = t[mirror(k as isize - 1, ni)];
-                let right = t[mirror(k as isize + 1, ni)];
-                t[k] += (left + right + 2).div_euclid(4);
-                k += 2;
+            while dp + 1 < width {
+                low[li] = x[dp];
+                high[hi] = x[dp + 1];
+                li += 1;
+                hi += 1;
+                dp += 2;
+            }
+            if dp < width {
+                low[li] = x[dp];
             }
         }
-        let nl = n.div_ceil(2);
-        let nh = n / 2;
-        let low: Vec<i32> = (0..nl).map(|i| t[2 * i]).collect();
-        let high: Vec<i32> = (0..nh).map(|i| t[2 * i + 1]).collect();
+        // Undo predict (step1: synthesis added `s >> 1`), then undo update
+        // (step0: synthesis subtracted `(2 + s) >> 2`). Reverse order, with the
+        // same aug/oth roles: predict acts on `high` reading `low`; update acts
+        // on `low` reading `high`.
+        let off_predict: isize = if even { 1 } else { 0 }; // ev after one swap
+        for i in 0..nh {
+            let ii = i as isize + off_predict;
+            let s = clamp_get(&low, ii - 1, nl) + clamp_get(&low, ii, nl);
+            high[i] -= s >> 1;
+        }
+        let off_update: isize = if even { 0 } else { 1 };
+        for i in 0..nl {
+            let ii = i as isize + off_update;
+            let s = clamp_get(&high, ii - 1, nh) + clamp_get(&high, ii, nh);
+            low[i] += (2 + s) >> 2;
+        }
         (low, high)
     }
 
     #[test]
-    fn idwt_53_round_trips_for_all_lengths() {
-        for n in 1..40usize {
-            let x: Vec<i32> = (0..n as i32).map(|i| (i * 37 + 5) % 101 - 50).collect();
-            let (low, high) = fwd_1d_53(&x);
-            let mut out = vec![0i32; n];
-            idwt_1d_53(&low, &high, &mut out);
-            assert_eq!(out, x, "round-trip failed for length {}", n);
+    fn idwt_level_1x1_passthrough() {
+        use super::{idwt_level, Band};
+        let ll = Band { w: 1, h: 1, data: vec![1234] };
+        let empty_col = Band { w: 0, h: 1, data: vec![] }; // HL: 0 wide, 1 tall
+        let empty_row = Band { w: 1, h: 0, data: vec![] }; // LH: 1 wide, 0 tall
+        let empty_hh = Band { w: 0, h: 0, data: vec![] };
+        let out = idwt_level(&ll, &empty_col, &empty_row, &empty_hh, 1, 1, true, true);
+        assert_eq!(out.data, vec![1234]);
+    }
+
+    #[test]
+    fn idwt_53_round_trips_for_all_lengths_and_parities() {
+        for &even in &[true, false] {
+            for n in 1..40usize {
+                let x: Vec<i32> = (0..n as i32).map(|i| (i * 37 + 5) % 101 - 50).collect();
+                let (low, high) = fwd_1d_53(&x, even);
+                let mut out = vec![0i32; n];
+                idwt_1d_53(&low, &high, &mut out, even);
+                assert_eq!(out, x, "round-trip failed for length {} even={}", n, even);
+            }
         }
     }
 }
