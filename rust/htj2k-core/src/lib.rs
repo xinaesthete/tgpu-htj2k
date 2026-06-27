@@ -7,6 +7,8 @@
 
 use wasm_bindgen::prelude::*;
 
+pub mod block_decoder;
+pub mod block_tables;
 pub mod geometry;
 pub mod packet;
 
@@ -462,6 +464,101 @@ pub fn parse_codestream(data: &[u8]) -> Result<CodestreamInfo, JsError> {
     }
 
     Ok(info)
+}
+
+/// Decode the first code-block of a single-tile, single-component,
+/// **0-decomposition** reversible codestream straight to pixels. Used to
+/// validate the HT block decoder end-to-end against OpenJPH (no DWT: the
+/// code-block coefficients are the level-shifted pixels).
+#[wasm_bindgen]
+pub fn decode_first_codeblock(data: &[u8]) -> Result<Vec<i32>, JsError> {
+    let info = parse_codestream(data)?;
+    let comp = info
+        .components
+        .first()
+        .copied()
+        .ok_or_else(|| JsError::new("codestream has no components"))?;
+    let tp = info
+        .tile_parts
+        .first()
+        .copied()
+        .ok_or_else(|| JsError::new("codestream has no tile-parts"))?;
+    if info.num_decompositions != 0 {
+        return Err(JsError::new("decode_first_codeblock expects 0 decompositions"));
+    }
+    let layout = geometry::compute_component_layout(
+        0,
+        0,
+        info.width as i64,
+        info.height as i64,
+        0,
+        info.code_block_width,
+        info.code_block_height,
+    );
+    let parsed = packet::parse_packets(
+        data,
+        tp.data_offset as usize,
+        tp.data_length as usize,
+        &layout,
+        info.components.len() as u32,
+    )
+    .map_err(|e| JsError::new(&e))?;
+    let cb = parsed
+        .code_blocks
+        .first()
+        .ok_or_else(|| JsError::new("no code-blocks decoded"))?;
+
+    let start = cb.offset as usize;
+    let end = start + cb.length_cleanup as usize;
+    if end > data.len() {
+        return Err(JsError::new("code-block data out of range"));
+    }
+    let coded = &data[start..end];
+    let decoded = block_decoder::decode_cleanup(
+        coded,
+        cb.missing_msbs,
+        cb.length_cleanup,
+        info.width,
+        info.height,
+    )
+    .ok_or_else(|| JsError::new("HT cleanup decode failed"))?;
+
+    // K_max for the LL subband (index 0): (exponent - 1) + guard bits.
+    let exp = *info.subband_exponents.first().unwrap_or(&0) as u32;
+    let k_max = exp.saturating_sub(1) + info.guard_bits as u32;
+    let coeffs = block_decoder::reversible_to_i32(&decoded, k_max);
+
+    // Undo the DC level shift for unsigned components.
+    let shift = if comp.signed { 0 } else { 1i32 << (comp.bit_depth - 1) };
+    Ok(coeffs.iter().map(|&c| c + shift).collect())
+}
+
+/// Debug: raw sign-magnitude output of the HT cleanup decode for the first
+/// code-block, plus [missing_msbs, k_max, guard_bits, exp0] appended at the end.
+#[wasm_bindgen]
+pub fn decode_first_codeblock_raw(data: &[u8]) -> Result<Vec<u32>, JsError> {
+    let info = parse_codestream(data)?;
+    let tp = info.tile_parts.first().copied()
+        .ok_or_else(|| JsError::new("no tile-parts"))?;
+    let layout = geometry::compute_component_layout(
+        0, 0, info.width as i64, info.height as i64, 0,
+        info.code_block_width, info.code_block_height);
+    let parsed = packet::parse_packets(data, tp.data_offset as usize,
+        tp.data_length as usize, &layout, info.components.len() as u32)
+        .map_err(|e| JsError::new(&e))?;
+    let cb = parsed.code_blocks.first()
+        .ok_or_else(|| JsError::new("no code-blocks"))?;
+    let coded = &data[cb.offset as usize..(cb.offset + cb.length_cleanup) as usize];
+    let mut decoded = block_decoder::decode_cleanup(
+        coded, cb.missing_msbs, cb.length_cleanup, info.width, info.height)
+        .ok_or_else(|| JsError::new("decode failed"))?;
+    let exp = *info.subband_exponents.first().unwrap_or(&0) as u32;
+    let k_max = exp.saturating_sub(1) + info.guard_bits as u32;
+    decoded.push(cb.missing_msbs);
+    decoded.push(k_max);
+    decoded.push(info.guard_bits as u32);
+    decoded.push(exp);
+    Ok(decoded)
 }
 
 /// Summary of packet parsing for the first tile-part of component 0.
