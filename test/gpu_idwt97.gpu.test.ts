@@ -2,7 +2,7 @@ import { test, expect } from "vitest";
 import { encode } from "openjph-wasm";
 import init, { decode_image, decode_dwt_input_97 } from "../rust/htj2k-core/pkg/htj2k_core.js";
 import { readFile } from "node:fs/promises";
-import { idwt97Gpu, irvToPixels } from "../src/gpu/idwt97";
+import { idwt97Gpu } from "../src/gpu/idwt97";
 
 let ready: Promise<unknown> | undefined;
 async function ensure() {
@@ -29,13 +29,14 @@ test("GPU inverse 9/7 DWT matches CPU decode_image within tolerance", async () =
         const cpu = decode_image(cs) as Int32Array;
 
         const inp = decode_dwt_input_97(cs);
-        const samples = (await idwt97Gpu({
+        // GPU does the float→pixel conversion too, so it equals decode_image
+        // directly (within float tolerance).
+        const gpu = (await idwt97Gpu({
           descriptor: inp.descriptor,
           coeffs: inp.coeffs,
           width: inp.width,
           height: inp.height,
-        }))!;
-        const gpu = irvToPixels(samples, inp.bit_depth, inp.signed);
+        }, { pixels: { bitDepth: inp.bit_depth, signed: inp.signed } }))! as Int32Array;
 
         let maxd = 0, sumAbs = 0;
         for (let i = 0; i < cpu.length; i++) {

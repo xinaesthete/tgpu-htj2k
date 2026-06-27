@@ -138,11 +138,37 @@ export interface DwtInput97 {
   height: number;
 }
 
+// Optional GPU float→pixel conversion (a separate, reusable pass — the DWT keeps
+// its float output as a general-purpose primitive). Port of `irv_to_pixels`
+// (`lib.rs`): scale by 2^bit_depth, round half-away-from-zero, clamp, level
+// shift. Params are precomputed on the CPU so the shader matches exactly.
+const Conv = d.struct({
+  n: d.u32, mul: d.f32, flLow: d.f32, flUp: d.f32,
+  sLow: d.i32, sUp: d.i32, add: d.i32, _pad: d.u32,
+});
+const convLayout = tgpu.bindGroupLayout({
+  C: { uniform: Conv },
+  src: { storage: (n: number) => d.arrayOf(d.f32, n), access: "readonly" },
+  dst: { storage: (n: number) => d.arrayOf(d.i32, n), access: "mutable" },
+});
+const CONVERT_TEMPLATE = /* wgsl */ `
+@compute @workgroup_size(64)
+fn convert(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x >= C.n) { return; }
+  let t = src[g.x] * C.mul;
+  var v: i32 = i32(t + select(-0.5, 0.5, t >= 0.0)); // round half away from zero
+  if (!(t >= C.flLow)) { v = C.sLow; }               // clamp to dynamic range
+  if (!(t < C.flUp)) { v = C.sUp; }
+  dst[g.x] = v + C.add;                               // DC level shift
+}
+`;
+
 interface Pipe {
   root: ReturnType<typeof tgpu.initFromDevice>;
   device: GPUDevice;
   pipeH: GPUComputePipeline;
   pipeV: GPUComputePipeline;
+  pipeConv: GPUComputePipeline;
 }
 let pipeCache: Promise<Pipe> | undefined;
 
@@ -161,7 +187,15 @@ async function getPipe(): Promise<Pipe> {
     });
     const pipeH = device.createComputePipeline({ layout: pipeLayout, compute: { module, entryPoint: "idwt_h" } });
     const pipeV = device.createComputePipeline({ layout: pipeLayout, compute: { module, entryPoint: "idwt_v" } });
-    return { root, device, pipeH, pipeV };
+
+    // Float→pixel conversion pipeline (its own layout: f32 src + i32 dst).
+    const conv = tgpu.resolveWithContext({ template: CONVERT_TEMPLATE, externals: { ...convLayout.bound }, names: "strict" });
+    const convMod = device.createShaderModule({ code: conv.code });
+    const convPipeLayout = device.createPipelineLayout({
+      bindGroupLayouts: conv.usedBindGroupLayouts.map((l) => root.unwrap(l)),
+    });
+    const pipeConv = device.createComputePipeline({ layout: convPipeLayout, compute: { module: convMod, entryPoint: "convert" } });
+    return { root, device, pipeH, pipeV, pipeConv };
   })();
   return pipeCache;
 }
@@ -177,6 +211,8 @@ function makePool(root: Root, cap: number, ccap: number) {
     hbuf: root.createBuffer(A(cap)).$usage("storage"),
     coeffBuf: root.createBuffer(A(ccap)).$usage("storage"),
     lvlBuf: root.createBuffer(Lvl).$usage("uniform"),
+    pixBuf: root.createBuffer(d.arrayOf(d.i32, Math.max(1, cap))).$usage("storage"),
+    convBuf: root.createBuffer(Conv).$usage("uniform"),
   };
 }
 let pool: ReturnType<typeof makePool> | undefined;
@@ -184,7 +220,7 @@ function ensurePool(root: Root, imgN: number, coeffLen: number) {
   if (pool && pool.cap >= imgN && pool.ccap >= coeffLen) return pool;
   const cap = Math.max(imgN, pool?.cap ?? 0);
   const ccap = Math.max(coeffLen, pool?.ccap ?? 0);
-  if (pool) for (const b of [pool.bufA, pool.bufB, pool.hbuf, pool.coeffBuf, pool.lvlBuf]) b.destroy();
+  if (pool) for (const b of [pool.bufA, pool.bufB, pool.hbuf, pool.coeffBuf, pool.lvlBuf, pool.pixBuf, pool.convBuf]) b.destroy();
   pool = makePool(root, cap, ccap);
   return pool;
 }
@@ -193,13 +229,17 @@ export interface Idwt97Opts {
   /** When false, skip the full readback and just sync (keep-on-GPU / timing).
    *  Returns null in that case. Default true. */
   readback?: boolean;
+  /** When set, run the GPU float→pixel conversion (scale + round + clamp + level
+   *  shift) and return Int32Array pixels instead of float samples. */
+  pixels?: { bitDepth: number; signed: boolean };
 }
 
-/** Run the inverse 9/7 DWT on the GPU. Returns normalized float samples
- *  (row-major `width * height`), or null when `opts.readback === false`. Apply
- *  `irvToPixels` for the level shift. */
-export async function idwt97Gpu(input: DwtInput97, opts: Idwt97Opts = {}): Promise<Float32Array | null> {
-  const { root, device, pipeH, pipeV } = await getPipe();
+/** Run the inverse 9/7 DWT on the GPU. Returns normalized float samples by
+ *  default (the DWT is a general-purpose primitive); with `opts.pixels`, runs
+ *  the GPU pixel conversion and returns Int32Array pixels. Null when
+ *  `opts.readback === false`. */
+export async function idwt97Gpu(input: DwtInput97, opts: Idwt97Opts = {}): Promise<Float32Array | Int32Array | null> {
+  const { root, device, pipeH, pipeV, pipeConv } = await getPipe();
   const { descriptor: desc, coeffs, width, height } = input;
   const at = (i: number): number => desc[i]!;
   const nLevels = at(1);
@@ -236,6 +276,30 @@ export async function idwt97Gpu(input: DwtInput97, opts: Idwt97Opts = {}): Promi
     device.queue.submit([enc.finish()]);
 
     [inbuf, outbuf] = [outbuf, inbuf];
+  }
+
+  // Optional GPU pixel conversion: f32 samples (in `inbuf`) -> i32 pixels.
+  if (opts.pixels) {
+    const { bitDepth, signed } = opts.pixels;
+    const sUp = 0x7fffffff >> (32 - bitDepth);
+    const sLow = -(sUp + 1);
+    p.convBuf.write({
+      n: imgN, mul: 2 ** bitDepth, flLow: sLow, flUp: -sLow,
+      sLow, sUp, add: signed ? 0 : 1 << (bitDepth - 1), _pad: 0,
+    });
+    const cbind = root.unwrap(root.createBindGroup(convLayout, { C: p.convBuf, src: inbuf, dst: p.pixBuf }));
+    const enc = device.createCommandEncoder();
+    const pc = enc.beginComputePass();
+    pc.setPipeline(pipeConv); pc.setBindGroup(0, cbind);
+    pc.dispatchWorkgroups(Math.ceil(imgN / 64));
+    pc.end();
+    device.queue.submit([enc.finish()]);
+    if (opts.readback === false) {
+      await device.queue.onSubmittedWorkDone();
+      return null;
+    }
+    const px = (await p.pixBuf.read()) as ArrayLike<number>;
+    return Int32Array.from(px).slice(0, imgN);
   }
 
   if (opts.readback === false) {
