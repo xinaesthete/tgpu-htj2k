@@ -43,6 +43,16 @@ test("parses geometry of a single-component HTJ2K codestream from OpenJPH", asyn
   // Layout geometry derived from the parsed params.
   expect(info.num_resolutions).toBe(info.num_decompositions + 1);
   expect(info.total_code_blocks(0)).toBeGreaterThan(0);
+
+  // Tile-part: a single-tile codestream has one tile-part whose packet data
+  // lies past SOD and within the codestream bounds.
+  expect(info.num_tile_parts).toBe(1);
+  expect(info.tile_part_tile_index(0)).toBe(0);
+  const off = info.tile_part_data_offset(0);
+  const len = info.tile_part_data_length(0);
+  expect(off).toBeGreaterThan(0);
+  expect(len).toBeGreaterThan(0);
+  expect(off + len).toBeLessThanOrEqual(cs.length);
   info.free();
 });
 

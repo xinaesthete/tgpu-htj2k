@@ -17,6 +17,7 @@ mod markers {
     pub const CAP: u16 = 0xFF50;
     pub const SOT: u16 = 0xFF90;
     pub const SOD: u16 = 0xFF93;
+    pub const EOC: u16 = 0xFFD9;
 }
 
 /// Wavelet kernel used by the (inverse) DWT.
@@ -35,6 +36,15 @@ struct Component {
     signed: bool,
     dx: u8,
     dy: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TilePart {
+    tile_index: u16,
+    /// Byte offset of the first packet (just past SOD) within the codestream.
+    data_offset: u32,
+    /// Length in bytes of this tile-part's packet data.
+    data_length: u32,
 }
 
 /// Parsed main-header metadata that drives the rest of the decode.
@@ -62,6 +72,7 @@ pub struct CodestreamInfo {
     guard_bits: u8,
     subband_exponents: Vec<u8>,
     subband_mantissas: Vec<u16>,
+    tile_parts: Vec<TilePart>,
 }
 
 /// Cursor over a big-endian byte slice with bounds-checked reads.
@@ -197,6 +208,36 @@ impl CodestreamInfo {
         self.num_decompositions as u32 + 1
     }
 
+    /// Number of tile-parts found in the codestream.
+    #[wasm_bindgen(getter)]
+    pub fn num_tile_parts(&self) -> u32 {
+        self.tile_parts.len() as u32
+    }
+
+    /// Tile index that tile-part `idx` belongs to.
+    pub fn tile_part_tile_index(&self, idx: u32) -> Result<u16, JsError> {
+        self.tile_parts
+            .get(idx as usize)
+            .map(|t| t.tile_index)
+            .ok_or_else(|| JsError::new("tile-part index out of range"))
+    }
+
+    /// Byte offset of tile-part `idx`'s packet data (just past SOD).
+    pub fn tile_part_data_offset(&self, idx: u32) -> Result<u32, JsError> {
+        self.tile_parts
+            .get(idx as usize)
+            .map(|t| t.data_offset)
+            .ok_or_else(|| JsError::new("tile-part index out of range"))
+    }
+
+    /// Length in bytes of tile-part `idx`'s packet data.
+    pub fn tile_part_data_length(&self, idx: u32) -> Result<u32, JsError> {
+        self.tile_parts
+            .get(idx as usize)
+            .map(|t| t.data_length)
+            .ok_or_else(|| JsError::new("tile-part index out of range"))
+    }
+
     /// Total number of code-blocks for component `idx` (single-tile geometry).
     pub fn total_code_blocks(&self, idx: u32) -> Result<u32, JsError> {
         let comp = self
@@ -265,6 +306,7 @@ pub fn parse_codestream(data: &[u8]) -> Result<CodestreamInfo, JsError> {
         guard_bits: 0,
         subband_exponents: Vec::new(),
         subband_mantissas: Vec::new(),
+        tile_parts: Vec::new(),
     };
     let mut seen_siz = false;
     let mut seen_cod = false;
@@ -272,7 +314,10 @@ pub fn parse_codestream(data: &[u8]) -> Result<CodestreamInfo, JsError> {
     loop {
         let marker = r.u16()?;
         match marker {
-            markers::SOT | markers::SOD => break, // reached tile data
+            markers::SOT | markers::SOD => {
+                r.pos -= 2; // leave the marker for the tile-part phase
+                break;
+            }
             markers::SIZ => {
                 let lsiz = r.u16()? as usize;
                 let seg_end = r.pos + lsiz - 2;
@@ -369,5 +414,51 @@ pub fn parse_codestream(data: &[u8]) -> Result<CodestreamInfo, JsError> {
     if !seen_cod {
         return Err(JsError::new("codestream missing COD marker"));
     }
+
+    // Tile-part phase: each tile-part is SOT … SOD <packet data>.
+    while r.remaining() >= 2 {
+        let marker = r.u16()?;
+        if marker == markers::EOC {
+            break;
+        }
+        if marker != markers::SOT {
+            return Err(JsError::new("expected SOT at start of tile-part"));
+        }
+        let sot_start = r.pos - 2;
+        let lsot = r.u16()? as usize;
+        let isot = r.u16()?;
+        let psot = r.u32()? as usize; // 0 => extends to EOC
+        let _tpsot = r.u8()?;
+        let _tnsot = r.u8()?;
+        r.pos = sot_start + 2 + lsot; // skip to end of SOT segment
+
+        // Tile-part header markers up to SOD.
+        loop {
+            let m = r.u16()?;
+            if m == markers::SOD {
+                break;
+            }
+            let len = r.u16()? as usize;
+            if len < 2 {
+                return Err(JsError::new("invalid tile-header marker segment length"));
+            }
+            r.skip(len - 2)?;
+        }
+
+        let data_offset = r.pos;
+        let tile_part_end = if psot == 0 {
+            data.len()
+        } else {
+            sot_start + psot
+        };
+        let data_length = tile_part_end.saturating_sub(data_offset);
+        info.tile_parts.push(TilePart {
+            tile_index: isot,
+            data_offset: data_offset as u32,
+            data_length: data_length as u32,
+        });
+        r.pos = tile_part_end.min(data.len());
+    }
+
     Ok(info)
 }
