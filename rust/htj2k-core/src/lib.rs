@@ -778,6 +778,50 @@ pub fn dwt_forward_53(
     Ok(ForwardDwt53 { descriptor, coeffs })
 }
 
+/// Forward (analysis) 9/7 DWT of a float image → packed `(descriptor, coeffs)`.
+/// Float half of the transform pair; CPU golden for the GPU forward 9/7.
+#[wasm_bindgen]
+pub struct ForwardDwt97 {
+    descriptor: Vec<u32>,
+    coeffs: Vec<f32>,
+}
+
+#[wasm_bindgen]
+impl ForwardDwt97 {
+    #[wasm_bindgen(getter)]
+    pub fn descriptor(&self) -> Vec<u32> {
+        self.descriptor.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn coeffs(&self) -> Vec<f32> {
+        self.coeffs.clone()
+    }
+}
+
+#[wasm_bindgen]
+pub fn dwt_forward_97(
+    samples: &[f32],
+    width: u32,
+    height: u32,
+    num_decompositions: u32,
+    code_block_width: u32,
+    code_block_height: u32,
+) -> Result<ForwardDwt97, JsError> {
+    let (descriptor, coeffs) = decode::dwt_forward_97(
+        samples, width, height, num_decompositions, code_block_width, code_block_height,
+    )
+    .ok_or_else(|| JsError::new("dwt_forward_97: bad input (size mismatch?)"))?;
+    Ok(ForwardDwt97 { descriptor, coeffs })
+}
+
+/// CPU inverse 9/7 on a packed `(descriptor, coeffs)` pair (float) — counterpart
+/// of `idwt53_cpu`, for round-tripping the forward 9/7.
+#[wasm_bindgen]
+pub fn idwt97_cpu(descriptor: &[u32], coeffs: &[f32]) -> Result<Vec<f32>, JsError> {
+    decode::idwt97_from_packed(descriptor, coeffs)
+        .ok_or_else(|| JsError::new("idwt97_cpu: malformed packed input"))
+}
+
 /// GPU inverse-DWT input for the irreversible (9/7) path: dequantized float
 /// subband coefficients + the same geometry descriptor as `DwtInput53`
 /// (kernel = 1). The GPU runs the float inverse 9/7 DWT; the caller converts

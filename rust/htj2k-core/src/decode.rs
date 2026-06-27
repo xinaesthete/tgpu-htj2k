@@ -743,6 +743,203 @@ pub fn dwt_forward_53(
     Some((header, coeffs))
 }
 
+// ---------------------------------------------------------------------------
+// Forward (analysis) 9/7 DWT — float, the irreversible analysis direction, and
+// the float half of the reusable transform pair. Exact inverse of `idwt_1d_97`.
+// ---------------------------------------------------------------------------
+
+/// Forward 1D 9/7 analysis — exact inverse of `idwt_1d_97`: deinterleave, run
+/// the four lifting steps in reverse with `aug += a*(l+r)`, then undo the K
+/// pre-scale (low /= K, high *= K).
+fn fwd_1d_97(x: &[f32], even: bool) -> (Vec<f32>, Vec<f32>) {
+    let width = x.len();
+    let nl = (width + if even { 1 } else { 0 }) >> 1;
+    let nh = (width + if even { 0 } else { 1 }) >> 1;
+    let mut low = vec![0f32; nl];
+    let mut high = vec![0f32; nh];
+    if width == 0 {
+        return (low, high);
+    }
+    if width == 1 {
+        if even {
+            low[0] = x[0];
+        } else {
+            high[0] = x[0] * 2.0;
+        }
+        return (low, high);
+    }
+    let low_phase = if even { 0usize } else { 1 };
+    for p in 0..width {
+        let idx = p >> 1;
+        if (p & 1) == low_phase {
+            low[idx] = x[p];
+        } else {
+            high[idx] = x[p];
+        }
+    }
+    // Undo the synthesis lifting: reverse step order, opposite sign.
+    for jj in 0..4 {
+        let j = 3 - jj;
+        let a = IRV97_STEPS[j];
+        let aug_low = (j & 1) == 0;
+        let ev = if aug_low { even } else { !even };
+        let off: isize = if ev { 0 } else { 1 };
+        if aug_low {
+            for i in 0..nl {
+                let ii = i as isize + off;
+                let s = clamp_get_f32(&high, ii - 1, nh) + clamp_get_f32(&high, ii, nh);
+                low[i] += a * s;
+            }
+        } else {
+            for i in 0..nh {
+                let ii = i as isize + off;
+                let s = clamp_get_f32(&low, ii - 1, nl) + clamp_get_f32(&low, ii, nl);
+                high[i] += a * s;
+            }
+        }
+    }
+    let k_inv = 1.0f32 / IRV97_K;
+    for v in low.iter_mut() {
+        *v *= k_inv;
+    }
+    for v in high.iter_mut() {
+        *v *= IRV97_K;
+    }
+    (low, high)
+}
+
+/// Forward one 9/7 level (float): vertical analysis then horizontal split.
+#[allow(clippy::too_many_arguments)]
+fn fwd_level_97(
+    input: &FBand,
+    rw0: usize,
+    rh0: usize,
+    rw1: usize,
+    rh1: usize,
+    even_x: bool,
+    even_y: bool,
+) -> (FBand, FBand, FBand, FBand) {
+    let w = input.w;
+    let h = input.h;
+    let mut a = vec![0f32; w * rh0];
+    let mut b = vec![0f32; w * rh1];
+    let mut col = vec![0f32; h];
+    for x in 0..w {
+        for y in 0..h {
+            col[y] = input.data[y * w + x];
+        }
+        let (lo, hi) = fwd_1d_97(&col, even_y);
+        for y in 0..rh0 {
+            a[y * w + x] = lo[y];
+        }
+        for y in 0..rh1 {
+            b[y * w + x] = hi[y];
+        }
+    }
+    let mut ll = vec![0f32; rw0 * rh0];
+    let mut hl = vec![0f32; rw1 * rh0];
+    let mut lh = vec![0f32; rw0 * rh1];
+    let mut hh = vec![0f32; rw1 * rh1];
+    for y in 0..rh0 {
+        let (lo, hi) = fwd_1d_97(&a[y * w..y * w + w], even_x);
+        ll[y * rw0..y * rw0 + rw0].copy_from_slice(&lo[..rw0]);
+        hl[y * rw1..y * rw1 + rw1].copy_from_slice(&hi[..rw1]);
+    }
+    for y in 0..rh1 {
+        let (lo, hi) = fwd_1d_97(&b[y * w..y * w + w], even_x);
+        lh[y * rw0..y * rw0 + rw0].copy_from_slice(&lo[..rw0]);
+        hh[y * rw1..y * rw1 + rw1].copy_from_slice(&hi[..rw1]);
+    }
+    (
+        FBand { w: rw0, h: rh0, data: ll },
+        FBand { w: rw1, h: rh0, data: hl },
+        FBand { w: rw0, h: rh1, data: lh },
+        FBand { w: rw1, h: rh1, data: hh },
+    )
+}
+
+/// Forward 9/7 DWT of a float image → packed `(descriptor, coeffs)` matching the
+/// inverse path (`idwt97_from_packed`). `kernel` field of the descriptor is 1.
+pub fn dwt_forward_97(
+    samples: &[f32],
+    width: u32,
+    height: u32,
+    num_decompositions: u32,
+    code_block_width: u32,
+    code_block_height: u32,
+) -> Option<(Vec<u32>, Vec<f32>)> {
+    let layout = compute_component_layout(
+        0, 0, width as i64, height as i64, num_decompositions, code_block_width, code_block_height,
+    );
+    let n_res = layout.resolutions.len();
+    let top = layout.resolutions.last()?;
+    let (w, h) = (top.width() as usize, top.height() as usize);
+    if samples.len() != w * h {
+        return None;
+    }
+    let mut cur = FBand { w, h, data: samples.to_vec() };
+    let mut detail: Vec<Option<(FBand, FBand, FBand)>> = (0..n_res).map(|_| None).collect();
+    for r in (1..n_res).rev() {
+        let res = &layout.resolutions[r];
+        let prev = &layout.resolutions[r - 1];
+        let rw0 = prev.width() as usize;
+        let rh0 = prev.height() as usize;
+        let rw1 = res.width() as usize - rw0;
+        let rh1 = res.height() as usize - rh0;
+        let (ll, hl, lh, hh) = fwd_level_97(&cur, rw0, rh0, rw1, rh1, (res.x0 & 1) == 0, (res.y0 & 1) == 0);
+        detail[r] = Some((hl, lh, hh));
+        cur = ll;
+    }
+    let n_levels = (n_res - 1) as u32;
+    let mut coeffs: Vec<f32> = Vec::new();
+    let mut header: Vec<u32> = vec![1, n_levels, cur.w as u32, cur.h as u32, 0];
+    coeffs.extend_from_slice(&cur.data);
+    for r in 1..n_res {
+        let res = &layout.resolutions[r];
+        let prev = &layout.resolutions[r - 1];
+        let (hl, lh, hh) = detail[r].take()?;
+        let hl_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&hl.data);
+        let lh_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&lh.data);
+        let hh_off = coeffs.len() as u32;
+        coeffs.extend_from_slice(&hh.data);
+        header.extend_from_slice(&[
+            prev.width(), prev.height(), hl.w as u32, lh.h as u32, res.width(), res.height(),
+            ((res.x0 & 1) == 0) as u32, ((res.y0 & 1) == 0) as u32, hl_off, lh_off, hh_off, 0,
+        ]);
+    }
+    Some((header, coeffs))
+}
+
+/// Inverse 9/7 from a packed `(descriptor, coeffs)` pair (float) — counterpart
+/// of `idwt53_from_packed`, for round-tripping the forward and as a reusable
+/// primitive. Returns the reconstructed float samples.
+pub fn idwt97_from_packed(descriptor: &[u32], coeffs: &[f32]) -> Option<Vec<f32>> {
+    let n_levels = *descriptor.get(1)? as usize;
+    let ll0_w = *descriptor.get(2)? as usize;
+    let ll0_h = *descriptor.get(3)? as usize;
+    let ll0_off = *descriptor.get(4)? as usize;
+    let mut cur = FBand {
+        w: ll0_w,
+        h: ll0_h,
+        data: coeffs.get(ll0_off..ll0_off + ll0_w * ll0_h)?.to_vec(),
+    };
+    for lvl in 0..n_levels {
+        let o = 5 + lvl * DWT_LEVEL_REC;
+        let rec = descriptor.get(o..o + DWT_LEVEL_REC)?;
+        let (rw0, rh0, rw1, rh1) = (rec[0] as usize, rec[1] as usize, rec[2] as usize, rec[3] as usize);
+        let (out_w, out_h) = (rec[4] as usize, rec[5] as usize);
+        let (even_x, even_y) = (rec[6] == 1, rec[7] == 1);
+        let (hl_off, lh_off, hh_off) = (rec[8] as usize, rec[9] as usize, rec[10] as usize);
+        let hl = FBand { w: rw1, h: rh0, data: coeffs.get(hl_off..hl_off + rw1 * rh0)?.to_vec() };
+        let lh = FBand { w: rw0, h: rh1, data: coeffs.get(lh_off..lh_off + rw0 * rh1)?.to_vec() };
+        let hh = FBand { w: rw1, h: rh1, data: coeffs.get(hh_off..hh_off + rw1 * rh1)?.to_vec() };
+        cur = idwt_level_f32(&cur, &hl, &lh, &hh, out_w, out_h, even_x, even_y);
+    }
+    Some(cur.data)
+}
+
 /// Quantization step size `delta` for an irreversible (9/7) subband, including
 /// the `2^-(31 - K_max)` fixed-point scale folded in — a port of OpenJPH
 /// `get_irrev_delta` (`ojph_params.cpp`) plus `ojph_subband.cpp`'s
@@ -944,7 +1141,9 @@ pub fn dwt_input_97(
 
 #[cfg(test)]
 mod tests {
-    use super::{dwt_forward_53, fwd_1d_53, idwt53_from_packed, idwt_1d_53};
+    use super::{
+        dwt_forward_53, dwt_forward_97, fwd_1d_53, idwt53_from_packed, idwt97_from_packed, idwt_1d_53,
+    };
 
     #[test]
     fn idwt_level_1x1_passthrough() {
@@ -981,6 +1180,28 @@ mod tests {
                 let (desc, coeffs) = dwt_forward_53(&img, w as u32, h as u32, lv, 64, 64).unwrap();
                 let back = idwt53_from_packed(&desc, &coeffs).unwrap();
                 assert_eq!(back, img, "round-trip failed w={} h={} lv={}", w, h, lv);
+            }
+        }
+    }
+
+    #[test]
+    fn dwt_forward_97_round_trips_within_tolerance() {
+        // Float 9/7 forward → inverse recovers the input within f32 tolerance.
+        for &(w, h) in &[(8usize, 8usize), (9, 9), (17, 23), (32, 32), (33, 48)] {
+            let max_lv = (w.min(h) as f64).log2().floor() as u32;
+            for lv in 1..=max_lv.min(4) {
+                let img: Vec<f32> = (0..(w * h) as i32)
+                    .map(|i| ((i * 37 + 11) % 4096 - 2048) as f32 / 4096.0)
+                    .collect();
+                let (desc, coeffs) = dwt_forward_97(&img, w as u32, h as u32, lv, 64, 64).unwrap();
+                let back = idwt97_from_packed(&desc, &coeffs).unwrap();
+                for i in 0..back.len() {
+                    assert!(
+                        (back[i] - img[i]).abs() < 1e-3,
+                        "round-trip drift {} at {} (w={} h={} lv={})",
+                        (back[i] - img[i]).abs(), i, w, h, lv
+                    );
+                }
             }
         }
     }
