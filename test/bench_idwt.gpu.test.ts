@@ -49,12 +49,11 @@ test.runIf(!!process.env.BENCH)("benchmark: inverse 5/3 DWT, CPU vs GPU (pooled,
   // growing the pool destabilises Dawn-on-Node. Largest size first so the
   // buffer pool is sized once and reused (repeated grow/destroy is the churn).
   process.stdout.write(`\n  size   | CPU DWT | GPU compute | speedup\n  -------+---------+-------------+--------\n`);
-  // Capped at 256² for reliability: the full per-size loop (openjph encode +
-  // CPU-DWT reps + GPU reps) is marginal at 512² and crashes at 1024² under
-  // Dawn-on-Node, though those compute fine in isolation. The CPU↔GPU crossover
-  // is ~512² (GPU ~1.1× with this naive kernel) — see docs.
+  // Largest size first so the buffer pool is sized once and reused. The
+  // shared-memory kernel keeps GPU memory low enough (no global scratch) to run
+  // the no-readback compute path up to 1024² here.
   const rows: string[] = [];
-  for (const n of [256, 128]) {
+  for (const n of [1024, 512, 256, 128]) {
     const cs = await encode({ data: makePx(n), width: n, height: n, components: 1, reversible: true, decompositions: 5 });
     const inp = decode_dwt_input_53(cs);
     const desc = inp.descriptor, coeffs = inp.coeffs;
