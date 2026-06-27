@@ -144,8 +144,12 @@ pub struct CodeBlock {
     pub num_passes: u32,
     /// Byte offset of this code-block's HT data within the codestream.
     pub offset: u32,
-    /// Byte length of this code-block's HT data.
+    /// Byte length of this code-block's HT data (cleanup + refinement).
     pub length: u32,
+    /// Length of the HT cleanup (CUP) segment — `lengths1` for the decoder.
+    pub length_cleanup: u32,
+    /// Length of the refinement (SPP/MRP) segment — `lengths2` for the decoder.
+    pub length_refinement: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +184,8 @@ pub fn parse_packets(
             x: u32,
             y: u32,
             len: u32,
+            len0: u32,
+            len1: u32,
             missing_msbs: u32,
             num_passes: u32,
         }
@@ -287,12 +293,12 @@ pub fn parse_packets(
                     let clz = (num_phld_passes + 1).leading_zeros() as i32;
                     let bits0 = lblock + 31 - clz;
                     let len0 = br.read_bits(bits0);
-                    let mut length = len0;
+                    let mut len1 = 0u32;
                     if effective_passes > 1 {
                         let bits1 = lblock + if effective_passes > 2 { 1 } else { 0 };
-                        let len1 = br.read_bits(bits1);
-                        length += len1;
+                        len1 = br.read_bits(bits1);
                     }
+                    let length = len0 + len1;
 
                     let _ = &mut missing_msbs;
                     packet_cbs.push(Cb {
@@ -301,6 +307,8 @@ pub fn parse_packets(
                         x,
                         y,
                         len: length,
+                        len0,
+                        len1,
                         missing_msbs,
                         num_passes: effective_passes,
                     });
@@ -329,6 +337,8 @@ pub fn parse_packets(
                 num_passes: cb.num_passes,
                 offset: off as u32,
                 length: cb.len,
+                length_cleanup: cb.len0,
+                length_refinement: cb.len1,
             });
         }
         if body > tile_end {

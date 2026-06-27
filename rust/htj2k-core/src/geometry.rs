@@ -162,7 +162,9 @@ fn make_subband(
         Orientation::HH => (1, 1),
     };
     let div = 1i64 << nb;
-    let half = 1i64 << (nb - 1);
+    // `half` is only used via `half * xob`; for the LL band (nb == 0, xob == 0)
+    // it is multiplied out, so 0 is safe and avoids a shift underflow.
+    let half = if nb >= 1 { 1i64 << (nb - 1) } else { 0 };
     // Subband coordinates (T.800 B-15).
     let x0 = ceil_div(tcx0 - half * xob, div);
     let x1 = ceil_div(tcx1 - half * xob, div);

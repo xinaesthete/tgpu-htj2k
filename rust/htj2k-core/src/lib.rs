@@ -471,6 +471,8 @@ pub struct PacketSummary {
     total_code_block_bytes: u32,
     bytes_consumed: u32,
     tile_data_length: u32,
+    max_num_passes: u32,
+    max_missing_msbs: u32,
 }
 
 #[wasm_bindgen]
@@ -490,6 +492,15 @@ impl PacketSummary {
     #[wasm_bindgen(getter)]
     pub fn tile_data_length(&self) -> u32 {
         self.tile_data_length
+    }
+    /// Largest number of coding passes across all code-blocks (1 = cleanup only).
+    #[wasm_bindgen(getter)]
+    pub fn max_num_passes(&self) -> u32 {
+        self.max_num_passes
+    }
+    #[wasm_bindgen(getter)]
+    pub fn max_missing_msbs(&self) -> u32 {
+        self.max_missing_msbs
     }
     /// True when packet parsing accounted for exactly the tile-part data.
     #[wasm_bindgen(getter)]
@@ -534,10 +545,14 @@ pub fn parse_packets_summary(data: &[u8]) -> Result<PacketSummary, JsError> {
     .map_err(|e| JsError::new(&e))?;
 
     let total: u32 = parsed.code_blocks.iter().map(|c| c.length).sum();
+    let max_num_passes = parsed.code_blocks.iter().map(|c| c.num_passes).max().unwrap_or(0);
+    let max_missing_msbs = parsed.code_blocks.iter().map(|c| c.missing_msbs).max().unwrap_or(0);
     Ok(PacketSummary {
         num_code_blocks: parsed.code_blocks.len() as u32,
         total_code_block_bytes: total,
         bytes_consumed: parsed.bytes_consumed,
         tile_data_length: tp.data_length,
+        max_num_passes,
+        max_missing_msbs,
     })
 }

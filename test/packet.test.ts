@@ -32,6 +32,19 @@ test("packet parse fully consumes the tile data (single component)", async () =>
   s.free();
 });
 
+test("0-decomposition lossless is cleanup-pass-only (decoder v1 scope)", async () => {
+  await ensure();
+  // No DWT: the single code-block's coefficients ARE the (level-shifted) pixels,
+  // which is how the HT block decoder will be validated against OpenJPH.
+  const width = 32, height = 32;
+  const cs = await encode({ data: ramp(width, height, 1), width, height, components: 1, reversible: true, decompositions: 0 });
+  const s = parse_packets_summary(cs);
+  expect(s.num_code_blocks).toBe(1);
+  expect(s.max_num_passes).toBe(1); // cleanup only — no SigProp/MagRef needed for v1
+  expect(s.fully_consumed).toBe(true);
+  s.free();
+});
+
 test("packet parse fully consumes the tile data (multi-component)", async () => {
   await ensure();
   const width = 48, height = 40, components = 3;
