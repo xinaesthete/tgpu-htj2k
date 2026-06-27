@@ -39,6 +39,10 @@ test("parses geometry of a single-component HTJ2K codestream from OpenJPH", asyn
   expect(info.quant_style).toBe(0);
   expect(info.guard_bits).toBeGreaterThanOrEqual(1);
   expect(info.num_quant_subbands).toBe(1 + 3 * info.num_decompositions);
+
+  // Layout geometry derived from the parsed params.
+  expect(info.num_resolutions).toBe(info.num_decompositions + 1);
+  expect(info.total_code_blocks(0)).toBeGreaterThan(0);
   info.free();
 });
 

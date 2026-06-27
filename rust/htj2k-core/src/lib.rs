@@ -7,6 +7,8 @@
 
 use wasm_bindgen::prelude::*;
 
+pub mod geometry;
+
 mod markers {
     pub const SOC: u16 = 0xFF4F;
     pub const SIZ: u16 = 0xFF51;
@@ -187,6 +189,32 @@ impl CodestreamInfo {
     /// Quantization mantissa (μ) of subband `idx` (0 for reversible).
     pub fn subband_mantissa(&self, idx: u32) -> u16 {
         self.subband_mantissas.get(idx as usize).copied().unwrap_or(0)
+    }
+
+    /// Number of resolution levels for a component (decompositions + 1).
+    #[wasm_bindgen(getter)]
+    pub fn num_resolutions(&self) -> u32 {
+        self.num_decompositions as u32 + 1
+    }
+
+    /// Total number of code-blocks for component `idx` (single-tile geometry).
+    pub fn total_code_blocks(&self, idx: u32) -> Result<u32, JsError> {
+        let comp = self
+            .components
+            .get(idx as usize)
+            .ok_or_else(|| JsError::new("component index out of range"))?;
+        let dx = comp.dx.max(1) as u32;
+        let dy = comp.dy.max(1) as u32;
+        let layout = geometry::compute_component_layout(
+            (self.x_offset / dx) as i64,
+            (self.y_offset / dy) as i64,
+            (self.width / dx) as i64,
+            (self.height / dy) as i64,
+            self.num_decompositions as u32,
+            self.code_block_width,
+            self.code_block_height,
+        );
+        Ok(layout.total_code_blocks())
     }
 
     /// Bit depth of component `idx` (0-based).
