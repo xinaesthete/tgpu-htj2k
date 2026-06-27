@@ -8,6 +8,7 @@
 use wasm_bindgen::prelude::*;
 
 pub mod geometry;
+pub mod packet;
 
 mod markers {
     pub const SOC: u16 = 0xFF4F;
@@ -415,7 +416,7 @@ pub fn parse_codestream(data: &[u8]) -> Result<CodestreamInfo, JsError> {
         return Err(JsError::new("codestream missing COD marker"));
     }
 
-    // Tile-part phase: each tile-part is SOT … SOD <packet data>.
+    // Tile-part phase: each tile-part is SOT ... SOD <packet data>.
     while r.remaining() >= 2 {
         let marker = r.u16()?;
         if marker == markers::EOC {
@@ -461,4 +462,82 @@ pub fn parse_codestream(data: &[u8]) -> Result<CodestreamInfo, JsError> {
     }
 
     Ok(info)
+}
+
+/// Summary of packet parsing for the first tile-part of component 0.
+#[wasm_bindgen]
+pub struct PacketSummary {
+    num_code_blocks: u32,
+    total_code_block_bytes: u32,
+    bytes_consumed: u32,
+    tile_data_length: u32,
+}
+
+#[wasm_bindgen]
+impl PacketSummary {
+    #[wasm_bindgen(getter)]
+    pub fn num_code_blocks(&self) -> u32 {
+        self.num_code_blocks
+    }
+    #[wasm_bindgen(getter)]
+    pub fn total_code_block_bytes(&self) -> u32 {
+        self.total_code_block_bytes
+    }
+    #[wasm_bindgen(getter)]
+    pub fn bytes_consumed(&self) -> u32 {
+        self.bytes_consumed
+    }
+    #[wasm_bindgen(getter)]
+    pub fn tile_data_length(&self) -> u32 {
+        self.tile_data_length
+    }
+    /// True when packet parsing accounted for exactly the tile-part data.
+    #[wasm_bindgen(getter)]
+    pub fn fully_consumed(&self) -> bool {
+        self.bytes_consumed == self.tile_data_length
+    }
+}
+
+/// Parse every packet of the first tile-part (component 0, single layer) and
+/// summarise. The key invariant is `bytes_consumed == tile_data_length`.
+#[wasm_bindgen]
+pub fn parse_packets_summary(data: &[u8]) -> Result<PacketSummary, JsError> {
+    let info = parse_codestream(data)?;
+    let comp = info
+        .components
+        .first()
+        .ok_or_else(|| JsError::new("codestream has no components"))?;
+    let tp = info
+        .tile_parts
+        .first()
+        .ok_or_else(|| JsError::new("codestream has no tile-parts"))?;
+
+    let dx = comp.dx.max(1) as u32;
+    let dy = comp.dy.max(1) as u32;
+    let layout = geometry::compute_component_layout(
+        (info.x_offset / dx) as i64,
+        (info.y_offset / dy) as i64,
+        (info.width / dx) as i64,
+        (info.height / dy) as i64,
+        info.num_decompositions as u32,
+        info.code_block_width,
+        info.code_block_height,
+    );
+
+    let parsed = packet::parse_packets(
+        data,
+        tp.data_offset as usize,
+        tp.data_length as usize,
+        &layout,
+        info.components.len() as u32,
+    )
+    .map_err(|e| JsError::new(&e))?;
+
+    let total: u32 = parsed.code_blocks.iter().map(|c| c.length).sum();
+    Ok(PacketSummary {
+        num_code_blocks: parsed.code_blocks.len() as u32,
+        total_code_block_bytes: total,
+        bytes_consumed: parsed.bytes_consumed,
+        tile_data_length: tp.data_length,
+    })
 }
