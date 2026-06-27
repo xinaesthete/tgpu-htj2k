@@ -29,12 +29,12 @@ test("GPU inverse 9/7 DWT matches CPU decode_image within tolerance", async () =
         const cpu = decode_image(cs) as Int32Array;
 
         const inp = decode_dwt_input_97(cs);
-        const samples = await idwt97Gpu({
+        const samples = (await idwt97Gpu({
           descriptor: inp.descriptor,
           coeffs: inp.coeffs,
           width: inp.width,
           height: inp.height,
-        });
+        }))!;
         const gpu = irvToPixels(samples, inp.bit_depth, inp.signed);
 
         let maxd = 0, sumAbs = 0;

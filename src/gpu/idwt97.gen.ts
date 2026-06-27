@@ -41,8 +41,6 @@ export const layout0 = tgpu.bindGroupLayout({
     storage: (arrayLength: number) => d.arrayOf(d.f32, arrayLength),
     access: 'mutable',
   },
-  scratch: {
-    storage: (arrayLength: number) => d.arrayOf(d.f32, arrayLength),
-    access: 'mutable',
-  },
+  // (global `scratch` dropped — the optimised kernel lifts in workgroup shared
+  // memory; see idwt97.ts)
 });
