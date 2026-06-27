@@ -1,6 +1,6 @@
-import { test, expect } from "vitest";
+import { test } from "vitest";
 import { encode } from "openjph-wasm";
-import init, { decode_image, decode_dwt_input_53, idwt53_cpu } from "../rust/htj2k-core/pkg/htj2k_core.js";
+import init, { decode_dwt_input_53, idwt53_cpu } from "../rust/htj2k-core/pkg/htj2k_core.js";
 import { readFile } from "node:fs/promises";
 import { idwt53Gpu } from "../src/gpu/idwt53";
 
@@ -25,37 +25,48 @@ function timeS(reps: number, warm: number, fn: () => unknown) {
   return median(ts);
 }
 
-// CPU vs GPU for the inverse 5/3 DWT, at small sizes. Kept lean and in its own
-// fork process (minimal surrounding wasm), because the Dawn (`webgpu`) addon
-// under Node destabilises after enough cumulative GPU+wasm work in one process
-// — which currently blocks rigorous large-size GPU timing here (a follow-up:
-// raise that ceiling or run in a browser). The CPU-side size sweep (entropy vs
-// DWT vs OpenJPH) lives in `bench_idwt.test.ts`, which has no such limit.
-test("benchmark: inverse 5/3 DWT, CPU vs GPU (small sizes)", async () => {
+function makePx(n: number) {
+  const px = new Uint16Array(n * n);
+  let s = 1;
+  for (let i = 0; i < px.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; px[i] = s & 0x0fff; }
+  return px;
+}
+
+// CPU vs GPU inverse 5/3 DWT. Buffer pooling (reuse across calls) keeps Dawn
+// stable; large-size GPU timing uses the *no-readback* path — the realistic
+// keep-on-GPU viz case, and the only one that survives Dawn-on-Node at large
+// sizes (the mapAsync readback, not the compute, is what crashes there). CPU is
+// the full `idwt53_cpu`.
+//
+// Opt-in (BENCH=1): benchmarks are timing-noisy and the heavy GPU work
+// accumulates in the reused fork process alongside the other GPU tests, which
+// destabilises Dawn-on-Node. Run on demand: `pnpm bench:gpu`.
+test.runIf(!!process.env.BENCH)("benchmark: inverse 5/3 DWT, CPU vs GPU (pooled, keep-on-GPU)", async () => {
   await ensure();
-  process.stdout.write(`\n  size  | CPU DWT | GPU DWT(+io) | ratio\n  ------+---------+--------------+------\n`);
-  // Single size: ~8 cumulative GPU calls in one Node process hits the Dawn
-  // teardown-stability ceiling, so we measure one size with few iterations.
-  for (const n of [64]) {
-    const px = new Uint16Array(n * n);
-    let s = 1;
-    for (let i = 0; i < px.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; px[i] = s & 0x0fff; }
-    const cs = await encode({ data: px, width: n, height: n, components: 1, reversible: true, decompositions: 5 });
+
+  // Pure timing (no readback). Correctness of the GPU DWT is covered by
+  // gpu_idwt53.gpu.test.ts; mixing a full-buffer readback in here and then
+  // growing the pool destabilises Dawn-on-Node. Largest size first so the
+  // buffer pool is sized once and reused (repeated grow/destroy is the churn).
+  process.stdout.write(`\n  size   | CPU DWT | GPU compute | speedup\n  -------+---------+-------------+--------\n`);
+  // Capped at 256² for reliability: the full per-size loop (openjph encode +
+  // CPU-DWT reps + GPU reps) is marginal at 512² and crashes at 1024² under
+  // Dawn-on-Node, though those compute fine in isolation. The CPU↔GPU crossover
+  // is ~512² (GPU ~1.1× with this naive kernel) — see docs.
+  const rows: string[] = [];
+  for (const n of [256, 128]) {
+    const cs = await encode({ data: makePx(n), width: n, height: n, components: 1, reversible: true, decompositions: 5 });
     const inp = decode_dwt_input_53(cs);
-    const desc = inp.descriptor, coeffs = inp.coeffs, shift = inp.level_shift;
-    const golden = decode_image(cs) as Int32Array;
+    const desc = inp.descriptor, coeffs = inp.coeffs;
     const gpuInput = { descriptor: desc, coeffs, width: inp.width, height: inp.height };
-
-    const g = await idwt53Gpu(gpuInput);
-    let m = 0;
-    for (let i = 0; i < golden.length; i++) if (g[i]! + shift !== golden[i]) m++;
-    expect(m, `GPU DWT @${n}`).toBe(0);
-
-    const tCpu = timeS(8, 2, () => idwt53_cpu(desc, coeffs));
-    const tGpu = await timeA(3, 1, () => idwt53Gpu(gpuInput));
-    process.stdout.write(
-      `  ${String(n).padStart(4)}² | ${tCpu.toFixed(2).padStart(7)} | ${tGpu.toFixed(2).padStart(7)} ms   | ${(tCpu / tGpu).toFixed(2)}x\n`,
-    );
+    const reps = n >= 512 ? 5 : 10;
+    const tCpu = timeS(reps, 2, () => idwt53_cpu(desc, coeffs));
+    const tGpu = await timeA(reps, 3, () => idwt53Gpu(gpuInput, { readback: false }));
+    rows.push(`  ${String(n).padStart(4)}²  | ${tCpu.toFixed(2).padStart(7)} | ${tGpu.toFixed(2).padStart(7)} ms  | ${(tCpu / tGpu).toFixed(2)}x`);
   }
-  process.stdout.write(`\n  Medians, ms. GPU includes upload + dispatch + full readback.\n`);
+  for (const r of rows.reverse()) process.stdout.write(r + "\n");
+  process.stdout.write(
+    `\n  Medians, ms. GPU = compute only (upload + dispatch + sync, result stays on\n` +
+    `  GPU); CPU = full inverse DWT into CPU memory. Buffers are pooled/reused.\n`,
+  );
 });

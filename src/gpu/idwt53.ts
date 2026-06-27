@@ -176,44 +176,70 @@ async function getPipe(): Promise<Pipe> {
   return pipeCache;
 }
 
+// Pooled GPU buffers, reused (and grown) across calls. Per-call allocate +
+// destroy churns the Dawn addon and destabilises it; reuse also matches a real
+// streaming decoder (allocate once per stream, not per frame). `bufA`/`bufB`
+// ping-pong as the running LL; `scratch` is the per-line lifting workspace.
+type Root = Awaited<ReturnType<typeof getPipe>>["root"];
+function makePool(root: Root, cap: number, ccap: number) {
+  const A = (n: number) => d.arrayOf(d.i32, Math.max(1, n));
+  return {
+    cap, ccap,
+    bufA: root.createBuffer(A(cap)).$usage("storage"),
+    bufB: root.createBuffer(A(cap)).$usage("storage"),
+    hbuf: root.createBuffer(A(cap)).$usage("storage"),
+    scratch: root.createBuffer(A(cap)).$usage("storage"),
+    coeffBuf: root.createBuffer(A(ccap)).$usage("storage"),
+    lvlBuf: root.createBuffer(Lvl).$usage("uniform"),
+  };
+}
+let pool: ReturnType<typeof makePool> | undefined;
+function ensurePool(root: Root, imgN: number, coeffLen: number) {
+  if (pool && pool.cap >= imgN && pool.ccap >= coeffLen) return pool;
+  const cap = Math.max(imgN, pool?.cap ?? 0);
+  const ccap = Math.max(coeffLen, pool?.ccap ?? 0);
+  if (pool) for (const b of [pool.bufA, pool.bufB, pool.hbuf, pool.scratch, pool.coeffBuf, pool.lvlBuf]) b.destroy();
+  pool = makePool(root, cap, ccap);
+  return pool;
+}
+
+export interface Idwt53Opts {
+  /** When false, skip the (Dawn-on-Node-fragile) full readback and just wait
+   *  for GPU completion — for timing the compute, or a keep-on-GPU pipeline.
+   *  Returns null in that case. Default true. */
+  readback?: boolean;
+}
+
 /** Run the inverse 5/3 DWT on the GPU. Returns the reconstructed coefficients
- *  (before level shift), row-major `width * height`. */
-export async function idwt53Gpu(input: DwtInput53): Promise<Int32Array> {
+ *  (before level shift), row-major `width * height`, or null when
+ *  `opts.readback === false`. */
+export async function idwt53Gpu(input: DwtInput53, opts: Idwt53Opts = {}): Promise<Int32Array | null> {
   const { root, device, pipeH, pipeV } = await getPipe();
   const { descriptor: desc, coeffs, width, height } = input;
   const at = (i: number): number => desc[i]!;
   const nLevels = at(1);
   const imgN = width * height;
-
-  // Typed per-call buffers.
   const ll0w = at(2), ll0h = at(3), ll0off = at(4);
-  const arr = (n: number) => d.arrayOf(d.i32, Math.max(1, n));
-  const coeffBuf = root.createBuffer(arr(coeffs.length), Array.from(coeffs)).$usage("storage");
-  let inbuf = root.createBuffer(arr(imgN)).$usage("storage");
-  let outbuf = root.createBuffer(arr(imgN)).$usage("storage");
-  const hbuf = root.createBuffer(arr(imgN)).$usage("storage");
-  const scratch = root.createBuffer(arr(imgN)).$usage("storage");
-  const lvlBuf = root.createBuffer(Lvl).$usage("uniform");
-  const owned = [coeffBuf, inbuf, outbuf, hbuf, scratch, lvlBuf];
 
-  // Seed inbuf with ll0.
-  inbuf.write(Array.from(coeffs.subarray(ll0off, ll0off + ll0w * ll0h)).concat(
-    new Array(Math.max(0, imgN - ll0w * ll0h)).fill(0)));
+  const p = ensurePool(root, imgN, coeffs.length);
+  // Upload coefficients and seed the running LL (only the ll0 region is read at
+  // level 1; deeper levels read the full previous-level output we write).
+  device.queue.writeBuffer(root.unwrap(p.coeffBuf), 0, coeffs as BufferSource);
+  device.queue.writeBuffer(root.unwrap(p.bufA), 0, coeffs.subarray(ll0off, ll0off + ll0w * ll0h) as BufferSource);
 
+  let inbuf = p.bufA, outbuf = p.bufB;
   for (let lvl = 0; lvl < nLevels; lvl++) {
     const o = 5 + lvl * 12;
     const outW = at(o + 4);
     const rowCount = at(o + 1) + at(o + 3); // rh0 + rh1
-    lvlBuf.write({
+    p.lvlBuf.write({
       rw0: at(o), rh0: at(o + 1), rw1: at(o + 2), rh1: at(o + 3),
       out_w: at(o + 4), out_h: at(o + 5), even_x: at(o + 6), even_y: at(o + 7),
       hl_off: at(o + 8), lh_off: at(o + 9), hh_off: at(o + 10), _pad: 0,
     });
-
-    const bind = root.createBindGroup(layout0, {
-      L: lvlBuf, inbuf, coeffs: coeffBuf, hbuf, outbuf, scratch,
-    });
-    const rawBind = root.unwrap(bind);
+    const rawBind = root.unwrap(root.createBindGroup(layout0, {
+      L: p.lvlBuf, inbuf, coeffs: p.coeffBuf, hbuf: p.hbuf, outbuf, scratch: p.scratch,
+    }));
 
     const enc = device.createCommandEncoder();
     const ph = enc.beginComputePass();
@@ -229,8 +255,10 @@ export async function idwt53Gpu(input: DwtInput53): Promise<Int32Array> {
     [inbuf, outbuf] = [outbuf, inbuf];
   }
 
+  if (opts.readback === false) {
+    await device.queue.onSubmittedWorkDone();
+    return null;
+  }
   const result = (await inbuf.read()) as ArrayLike<number>;
-  const out = Int32Array.from(result).slice(0, imgN);
-  for (const b of owned) b.destroy();
-  return out;
+  return Int32Array.from(result).slice(0, imgN);
 }
