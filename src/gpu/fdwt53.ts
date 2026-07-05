@@ -192,7 +192,7 @@ export interface Fdwt53Opts {
 export async function fdwt53Gpu(input: FwdInput53, opts: Fdwt53Opts = {}): Promise<Int32Array | null> {
   const { root, device, pipeV, pipeH } = await getPipe();
   const { descriptor: desc, image, width, height, coeffsLen } = input;
-  const at = (i: number): number => desc[i]!;
+  const at = (i: number): number => desc[i] ?? 0;
   const nLevels = at(1);
   const imgN = width * height;
 

@@ -196,7 +196,7 @@ export interface Fdwt97Opts {
 export async function fdwt97Gpu(input: FwdInput97, opts: Fdwt97Opts = {}): Promise<Float32Array | null> {
   const { root, device, pipeV, pipeH } = await getPipe();
   const { descriptor: desc, image, width, height, coeffsLen } = input;
-  const at = (i: number): number => desc[i]!;
+  const at = (i: number): number => desc[i] ?? 0;
   const nLevels = at(1);
   const imgN = width * height;
 

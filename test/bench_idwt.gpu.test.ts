@@ -77,7 +77,7 @@ test.runIf(!!process.env.BENCH)("benchmark: inverse 5/3 DWT, CPU vs GPU (pooled,
       `  ${String(n).padStart(4)}²  | ${tCpu.toFixed(2).padStart(7)} | ${tGpu.toFixed(2).padStart(7)} ms  | ${(tCpu / tGpu).toFixed(2)}x`,
     );
   }
-  for (const r of rows.reverse()) process.stdout.write(r + "\n");
+  for (const r of rows.reverse()) process.stdout.write(`${r}\n`);
   process.stdout.write(
     `\n  Medians, ms. GPU = compute only (upload + dispatch + sync, result stays on\n` +
       `  GPU); CPU = full inverse DWT into CPU memory. Buffers are pooled/reused.\n`,
