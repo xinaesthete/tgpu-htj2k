@@ -1,8 +1,8 @@
 // Bootstrapped by tgpu-gen from the inverse-9/7 WGSL, then curated to the typed
 // resource interface (uniform struct + f32 bind group layout). The compute
 // logic lives in `idwt97.ts` as a WGSL template resolved against this.
-import tgpu from 'typegpu';
-import * as d from 'typegpu/data';
+import tgpu from "typegpu";
+import * as d from "typegpu/data";
 
 /* structs */
 export const Lvl = d.struct({
@@ -27,19 +27,19 @@ export const layout0 = tgpu.bindGroupLayout({
   },
   inbuf: {
     storage: (arrayLength: number) => d.arrayOf(d.f32, arrayLength),
-    access: 'readonly',
+    access: "readonly",
   },
   coeffs: {
     storage: (arrayLength: number) => d.arrayOf(d.f32, arrayLength),
-    access: 'readonly',
+    access: "readonly",
   },
   hbuf: {
     storage: (arrayLength: number) => d.arrayOf(d.f32, arrayLength),
-    access: 'mutable',
+    access: "mutable",
   },
   outbuf: {
     storage: (arrayLength: number) => d.arrayOf(d.f32, arrayLength),
-    access: 'mutable',
+    access: "mutable",
   },
   // (global `scratch` dropped — the optimised kernel lifts in workgroup shared
   // memory; see idwt97.ts)

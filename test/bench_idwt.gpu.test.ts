@@ -1,7 +1,7 @@
-import { test } from "vitest";
-import { encode } from "openjph-wasm";
-import init, { decode_dwt_input_53, idwt53_cpu } from "../rust/htj2k-core/pkg/htj2k_core.js";
 import { readFile } from "node:fs/promises";
+import { encode } from "openjph-wasm";
+import { test } from "vitest";
+import init, { decode_dwt_input_53, idwt53_cpu } from "../rust/htj2k-core/pkg/htj2k_core.js";
 import { idwt53Gpu } from "../src/gpu/idwt53";
 
 let ready: Promise<unknown> | undefined;
@@ -15,20 +15,31 @@ const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.len
 async function timeA(reps: number, warm: number, fn: () => Promise<unknown>) {
   for (let i = 0; i < warm; i++) await fn();
   const ts: number[] = [];
-  for (let i = 0; i < reps; i++) { const t = performance.now(); await fn(); ts.push(performance.now() - t); }
+  for (let i = 0; i < reps; i++) {
+    const t = performance.now();
+    await fn();
+    ts.push(performance.now() - t);
+  }
   return median(ts);
 }
 function timeS(reps: number, warm: number, fn: () => unknown) {
   for (let i = 0; i < warm; i++) fn();
   const ts: number[] = [];
-  for (let i = 0; i < reps; i++) { const t = performance.now(); fn(); ts.push(performance.now() - t); }
+  for (let i = 0; i < reps; i++) {
+    const t = performance.now();
+    fn();
+    ts.push(performance.now() - t);
+  }
   return median(ts);
 }
 
 function makePx(n: number) {
   const px = new Uint16Array(n * n);
   let s = 1;
-  for (let i = 0; i < px.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; px[i] = s & 0x0fff; }
+  for (let i = 0; i < px.length; i++) {
+    s = (s * 1103515245 + 12345) & 0x7fffffff;
+    px[i] = s & 0x0fff;
+  }
   return px;
 }
 
@@ -56,16 +67,19 @@ test.runIf(!!process.env.BENCH)("benchmark: inverse 5/3 DWT, CPU vs GPU (pooled,
   for (const n of [1024, 512, 256, 128]) {
     const cs = await encode({ data: makePx(n), width: n, height: n, components: 1, reversible: true, decompositions: 5 });
     const inp = decode_dwt_input_53(cs);
-    const desc = inp.descriptor, coeffs = inp.coeffs;
+    const desc = inp.descriptor,
+      coeffs = inp.coeffs;
     const gpuInput = { descriptor: desc, coeffs, width: inp.width, height: inp.height };
     const reps = n >= 512 ? 5 : 10;
     const tCpu = timeS(reps, 2, () => idwt53_cpu(desc, coeffs));
     const tGpu = await timeA(reps, 3, () => idwt53Gpu(gpuInput, { readback: false }));
-    rows.push(`  ${String(n).padStart(4)}²  | ${tCpu.toFixed(2).padStart(7)} | ${tGpu.toFixed(2).padStart(7)} ms  | ${(tCpu / tGpu).toFixed(2)}x`);
+    rows.push(
+      `  ${String(n).padStart(4)}²  | ${tCpu.toFixed(2).padStart(7)} | ${tGpu.toFixed(2).padStart(7)} ms  | ${(tCpu / tGpu).toFixed(2)}x`,
+    );
   }
   for (const r of rows.reverse()) process.stdout.write(r + "\n");
   process.stdout.write(
     `\n  Medians, ms. GPU = compute only (upload + dispatch + sync, result stays on\n` +
-    `  GPU); CPU = full inverse DWT into CPU memory. Buffers are pooled/reused.\n`,
+      `  GPU); CPU = full inverse DWT into CPU memory. Buffers are pooled/reused.\n`,
   );
 });
