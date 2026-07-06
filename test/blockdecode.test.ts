@@ -1,7 +1,7 @@
-import { test, expect } from "vitest";
-import { encode, decode } from "openjph-wasm";
-import init, { decode_first_codeblock } from "../rust/htj2k-core/pkg/htj2k_core.js";
 import { readFile } from "node:fs/promises";
+import { decode, encode } from "openjph-wasm";
+import { expect, test } from "vitest";
+import init, { decode_first_codeblock } from "../rust/htj2k-core/pkg/htj2k_core.js";
 
 let ready: Promise<unknown> | undefined;
 async function ensure() {
@@ -27,27 +27,34 @@ async function compareToOpenJph(width: number, height: number, pixels: Uint16Arr
 }
 
 test("HT block decode == OpenJPH: constant image", async () => {
-  const w = 16, h = 16;
+  const w = 16,
+    h = 16;
   await compareToOpenJph(w, h, new Uint16Array(w * h).fill(1234));
 });
 
 test("HT block decode == OpenJPH: gradient (32x32)", async () => {
-  const w = 32, h = 32;
+  const w = 32,
+    h = 32;
   const px = new Uint16Array(w * h);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) px[y * w + x] = (x * 7 + y * 13) & 0x0fff;
   await compareToOpenJph(w, h, px);
 });
 
 test("HT block decode == OpenJPH: pseudo-random (64x64)", async () => {
-  const w = 64, h = 64;
+  const w = 64,
+    h = 64;
   const px = new Uint16Array(w * h);
   let s = 0x12345;
-  for (let i = 0; i < px.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; px[i] = s & 0x0fff; }
+  for (let i = 0; i < px.length; i++) {
+    s = (s * 1103515245 + 12345) & 0x7fffffff;
+    px[i] = s & 0x0fff;
+  }
   await compareToOpenJph(w, h, px);
 });
 
 test("HT block decode == OpenJPH: 8-bit image (48x40)", async () => {
-  const w = 48, h = 40;
+  const w = 48,
+    h = 40;
   const px = new Uint16Array(w * h);
   for (let i = 0; i < px.length; i++) px[i] = (i * 37) & 0xff;
   // encode as 8-bit by passing a Uint8Array

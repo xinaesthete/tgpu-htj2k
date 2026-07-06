@@ -1,7 +1,7 @@
-import { test, expect } from "vitest";
-import { encode, decode } from "openjph-wasm";
-import init, { decode_image, decode_dwt_input_53, idwt53_cpu } from "../rust/htj2k-core/pkg/htj2k_core.js";
 import { readFile } from "node:fs/promises";
+import { decode, encode } from "openjph-wasm";
+import { expect, test } from "vitest";
+import init, { decode_dwt_input_53, decode_image, idwt53_cpu } from "../rust/htj2k-core/pkg/htj2k_core.js";
 
 let ready: Promise<unknown> | undefined;
 async function ensure() {
@@ -14,13 +14,21 @@ const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.len
 async function timeA(reps: number, warm: number, fn: () => Promise<unknown>) {
   for (let i = 0; i < warm; i++) await fn();
   const ts: number[] = [];
-  for (let i = 0; i < reps; i++) { const t = performance.now(); await fn(); ts.push(performance.now() - t); }
+  for (let i = 0; i < reps; i++) {
+    const t = performance.now();
+    await fn();
+    ts.push(performance.now() - t);
+  }
   return median(ts);
 }
 function timeS(reps: number, warm: number, fn: () => unknown) {
   for (let i = 0; i < warm; i++) fn();
   const ts: number[] = [];
-  for (let i = 0; i < reps; i++) { const t = performance.now(); fn(); ts.push(performance.now() - t); }
+  for (let i = 0; i < reps; i++) {
+    const t = performance.now();
+    fn();
+    ts.push(performance.now() - t);
+  }
   return median(ts);
 }
 
@@ -35,10 +43,15 @@ test("benchmark: CPU decode breakdown vs OpenJPH", async () => {
   for (const n of [64, 128, 256, 512]) {
     const px = new Uint16Array(n * n);
     let s = 1;
-    for (let i = 0; i < px.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; px[i] = s & 0x0fff; }
+    for (let i = 0; i < px.length; i++) {
+      s = (s * 1103515245 + 12345) & 0x7fffffff;
+      px[i] = s & 0x0fff;
+    }
     const cs = await encode({ data: px, width: n, height: n, components: 1, reversible: true, decompositions: 5 });
     const inp = decode_dwt_input_53(cs);
-    const desc = inp.descriptor, coeffs = inp.coeffs, shift = inp.level_shift;
+    const desc = inp.descriptor,
+      coeffs = inp.coeffs,
+      shift = inp.level_shift;
 
     // Correctness (also covers sizes beyond the unit tests).
     const golden = decode_image(cs) as Int32Array;

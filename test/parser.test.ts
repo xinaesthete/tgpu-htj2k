@@ -1,17 +1,16 @@
-import { test, expect } from "vitest";
 import { encode } from "openjph-wasm";
+import { expect, test } from "vitest";
 import { parseCodestream, WaveletKernel } from "../src/wasm/htj2kCore";
 
 function ramp(width: number, height: number, components: number): Uint16Array {
   const data = new Uint16Array(components * width * height);
-  for (let c = 0; c < components; c++)
-    for (let i = 0; i < width * height; i++)
-      data[c * width * height + i] = (c * 997 + i) & 0xffff;
+  for (let c = 0; c < components; c++) for (let i = 0; i < width * height; i++) data[c * width * height + i] = (c * 997 + i) & 0xffff;
   return data;
 }
 
 test("parses geometry of a single-component HTJ2K codestream from OpenJPH", async () => {
-  const width = 64, height = 48;
+  const width = 64,
+    height = 48;
   const cs = await encode({
     data: ramp(width, height, 1),
     width,
@@ -57,7 +56,9 @@ test("parses geometry of a single-component HTJ2K codestream from OpenJPH", asyn
 });
 
 test("parses a multi-component (volumetric) codestream", async () => {
-  const width = 32, height = 32, components = 4;
+  const width = 32,
+    height = 32,
+    components = 4;
   const cs = await encode({
     data: ramp(width, height, components),
     width,

@@ -1,7 +1,7 @@
-import { test, expect } from "vitest";
-import { encode } from "openjph-wasm";
-import init, { decode_image, decode_dwt_input_97 } from "../rust/htj2k-core/pkg/htj2k_core.js";
 import { readFile } from "node:fs/promises";
+import { encode } from "openjph-wasm";
+import { expect, test } from "vitest";
+import init, { decode_dwt_input_97, decode_image } from "../rust/htj2k-core/pkg/htj2k_core.js";
 import { idwt97Gpu } from "../src/gpu/idwt97";
 
 let ready: Promise<unknown> | undefined;
@@ -15,13 +15,20 @@ async function ensure() {
 
 test("GPU inverse 9/7 DWT matches CPU decode_image within tolerance", async () => {
   await ensure();
-  const sizes: [number, number][] = [[16, 16], [9, 9], [33, 48]];
+  const sizes: [number, number][] = [
+    [16, 16],
+    [9, 9],
+    [33, 48],
+  ];
   for (const quality of [undefined, 0.02] as const) {
     for (const [w, h] of sizes) {
       for (let lv = 1; lv <= Math.min(3, Math.floor(Math.log2(Math.min(w, h)))); lv++) {
         const px = new Uint16Array(w * h);
         let s = 1;
-        for (let i = 0; i < px.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; px[i] = s & 0x0fff; }
+        for (let i = 0; i < px.length; i++) {
+          s = (s * 1103515245 + 12345) & 0x7fffffff;
+          px[i] = s & 0x0fff;
+        }
         const opts: any = { data: px, width: w, height: h, components: 1, reversible: false, decompositions: lv };
         if (quality !== undefined) opts.quality = quality;
         const cs = await encode(opts);
@@ -31,14 +38,18 @@ test("GPU inverse 9/7 DWT matches CPU decode_image within tolerance", async () =
         const inp = decode_dwt_input_97(cs);
         // GPU does the float→pixel conversion too, so it equals decode_image
         // directly (within float tolerance).
-        const gpu = (await idwt97Gpu({
-          descriptor: inp.descriptor,
-          coeffs: inp.coeffs,
-          width: inp.width,
-          height: inp.height,
-        }, { pixels: { bitDepth: inp.bit_depth, signed: inp.signed } }))! as Int32Array;
+        const gpu = (await idwt97Gpu(
+          {
+            descriptor: inp.descriptor,
+            coeffs: inp.coeffs,
+            width: inp.width,
+            height: inp.height,
+          },
+          { pixels: { bitDepth: inp.bit_depth, signed: inp.signed } },
+        ))! as Int32Array;
 
-        let maxd = 0, sumAbs = 0;
+        let maxd = 0,
+          sumAbs = 0;
         for (let i = 0; i < cpu.length; i++) {
           const dd = Math.abs(cpu[i]! - gpu[i]!);
           maxd = Math.max(maxd, dd);

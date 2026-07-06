@@ -151,7 +151,9 @@ async function getPipe(): Promise<Pipe> {
     const device = await getDevice();
     const root = tgpu.initFromDevice({ device });
     const { code, usedBindGroupLayouts } = tgpu.resolveWithContext({
-      template: TEMPLATE, externals: { ...fwdLayout.bound }, names: "strict",
+      template: TEMPLATE,
+      externals: { ...fwdLayout.bound },
+      names: "strict",
     });
     const module = device.createShaderModule({ code });
     const pipeLayout = device.createPipelineLayout({ bindGroupLayouts: usedBindGroupLayouts.map((l) => root.unwrap(l)) });
@@ -166,7 +168,8 @@ type Root = Awaited<ReturnType<typeof getPipe>>["root"];
 function makePool(root: Root, cap: number, ccap: number) {
   const A = (n: number) => d.arrayOf(d.f32, Math.max(1, n));
   return {
-    cap, ccap,
+    cap,
+    ccap,
     bufA: root.createBuffer(A(cap)).$usage("storage"),
     bufB: root.createBuffer(A(cap)).$usage("storage"),
     hbuf: root.createBuffer(A(cap)).$usage("storage"),
@@ -193,33 +196,51 @@ export interface Fdwt97Opts {
 export async function fdwt97Gpu(input: FwdInput97, opts: Fdwt97Opts = {}): Promise<Float32Array | null> {
   const { root, device, pipeV, pipeH } = await getPipe();
   const { descriptor: desc, image, width, height, coeffsLen } = input;
-  const at = (i: number): number => desc[i]!;
+  const at = (i: number): number => desc[i] ?? 0;
   const nLevels = at(1);
   const imgN = width * height;
 
   const p = ensurePool(root, imgN, coeffsLen);
   device.queue.writeBuffer(root.unwrap(p.bufA), 0, image as BufferSource);
 
-  let inbuf = p.bufA, outbuf = p.bufB;
+  let inbuf = p.bufA,
+    outbuf = p.bufB;
   for (let lvl = nLevels - 1; lvl >= 0; lvl--) {
     const o = 5 + lvl * 12;
     const outW = at(o + 4);
     const rowCount = at(o + 1) + at(o + 3);
     p.lvlBuf.write({
-      rw0: at(o), rh0: at(o + 1), rw1: at(o + 2), rh1: at(o + 3),
-      out_w: at(o + 4), out_h: at(o + 5), even_x: at(o + 6), even_y: at(o + 7),
-      hl_off: at(o + 8), lh_off: at(o + 9), hh_off: at(o + 10), _pad: 0,
+      rw0: at(o),
+      rh0: at(o + 1),
+      rw1: at(o + 2),
+      rh1: at(o + 3),
+      out_w: at(o + 4),
+      out_h: at(o + 5),
+      even_x: at(o + 6),
+      even_y: at(o + 7),
+      hl_off: at(o + 8),
+      lh_off: at(o + 9),
+      hh_off: at(o + 10),
+      _pad: 0,
     });
-    const bind = root.unwrap(root.createBindGroup(fwdLayout, {
-      L: p.lvlBuf, inbuf, hbuf: p.hbuf, outbuf, coeffs: p.coeffBuf,
-    }));
+    const bind = root.unwrap(
+      root.createBindGroup(fwdLayout, {
+        L: p.lvlBuf,
+        inbuf,
+        hbuf: p.hbuf,
+        outbuf,
+        coeffs: p.coeffBuf,
+      }),
+    );
     const enc = device.createCommandEncoder();
     const pv = enc.beginComputePass();
-    pv.setPipeline(pipeV); pv.setBindGroup(0, bind);
+    pv.setPipeline(pipeV);
+    pv.setBindGroup(0, bind);
     pv.dispatchWorkgroups(outW);
     pv.end();
     const ph = enc.beginComputePass();
-    ph.setPipeline(pipeH); ph.setBindGroup(0, bind);
+    ph.setPipeline(pipeH);
+    ph.setBindGroup(0, bind);
     ph.dispatchWorkgroups(rowCount);
     ph.end();
     device.queue.submit([enc.finish()]);

@@ -143,8 +143,14 @@ export interface DwtInput97 {
 // (`lib.rs`): scale by 2^bit_depth, round half-away-from-zero, clamp, level
 // shift. Params are precomputed on the CPU so the shader matches exactly.
 const Conv = d.struct({
-  n: d.u32, mul: d.f32, flLow: d.f32, flUp: d.f32,
-  sLow: d.i32, sUp: d.i32, add: d.i32, _pad: d.u32,
+  n: d.u32,
+  mul: d.f32,
+  flLow: d.f32,
+  flUp: d.f32,
+  sLow: d.i32,
+  sUp: d.i32,
+  add: d.i32,
+  _pad: d.u32,
 });
 const convLayout = tgpu.bindGroupLayout({
   C: { uniform: Conv },
@@ -205,7 +211,8 @@ type Root = Awaited<ReturnType<typeof getPipe>>["root"];
 function makePool(root: Root, cap: number, ccap: number) {
   const A = (n: number) => d.arrayOf(d.f32, Math.max(1, n));
   return {
-    cap, ccap,
+    cap,
+    ccap,
     bufA: root.createBuffer(A(cap)).$usage("storage"),
     bufB: root.createBuffer(A(cap)).$usage("storage"),
     hbuf: root.createBuffer(A(cap)).$usage("storage"),
@@ -244,33 +251,53 @@ export async function idwt97Gpu(input: DwtInput97, opts: Idwt97Opts = {}): Promi
   const at = (i: number): number => desc[i]!;
   const nLevels = at(1);
   const imgN = width * height;
-  const ll0w = at(2), ll0h = at(3), ll0off = at(4);
+  const ll0w = at(2),
+    ll0h = at(3),
+    ll0off = at(4);
 
   const p = ensurePool(root, imgN, coeffs.length);
   device.queue.writeBuffer(root.unwrap(p.coeffBuf), 0, coeffs as BufferSource);
   device.queue.writeBuffer(root.unwrap(p.bufA), 0, coeffs.subarray(ll0off, ll0off + ll0w * ll0h) as BufferSource);
 
-  let inbuf = p.bufA, outbuf = p.bufB;
+  let inbuf = p.bufA,
+    outbuf = p.bufB;
   for (let lvl = 0; lvl < nLevels; lvl++) {
     const o = 5 + lvl * 12;
     const outW = at(o + 4);
     const rowCount = at(o + 1) + at(o + 3);
     p.lvlBuf.write({
-      rw0: at(o), rh0: at(o + 1), rw1: at(o + 2), rh1: at(o + 3),
-      out_w: at(o + 4), out_h: at(o + 5), even_x: at(o + 6), even_y: at(o + 7),
-      hl_off: at(o + 8), lh_off: at(o + 9), hh_off: at(o + 10), _pad: 0,
+      rw0: at(o),
+      rh0: at(o + 1),
+      rw1: at(o + 2),
+      rh1: at(o + 3),
+      out_w: at(o + 4),
+      out_h: at(o + 5),
+      even_x: at(o + 6),
+      even_y: at(o + 7),
+      hl_off: at(o + 8),
+      lh_off: at(o + 9),
+      hh_off: at(o + 10),
+      _pad: 0,
     });
-    const rawBind = root.unwrap(root.createBindGroup(layout0, {
-      L: p.lvlBuf, inbuf, coeffs: p.coeffBuf, hbuf: p.hbuf, outbuf,
-    }));
+    const rawBind = root.unwrap(
+      root.createBindGroup(layout0, {
+        L: p.lvlBuf,
+        inbuf,
+        coeffs: p.coeffBuf,
+        hbuf: p.hbuf,
+        outbuf,
+      }),
+    );
 
     const enc = device.createCommandEncoder();
     const ph = enc.beginComputePass();
-    ph.setPipeline(pipeH); ph.setBindGroup(0, rawBind);
+    ph.setPipeline(pipeH);
+    ph.setBindGroup(0, rawBind);
     ph.dispatchWorkgroups(rowCount);
     ph.end();
     const pv = enc.beginComputePass();
-    pv.setPipeline(pipeV); pv.setBindGroup(0, rawBind);
+    pv.setPipeline(pipeV);
+    pv.setBindGroup(0, rawBind);
     pv.dispatchWorkgroups(outW);
     pv.end();
     device.queue.submit([enc.finish()]);
@@ -284,13 +311,20 @@ export async function idwt97Gpu(input: DwtInput97, opts: Idwt97Opts = {}): Promi
     const sUp = 0x7fffffff >> (32 - bitDepth);
     const sLow = -(sUp + 1);
     p.convBuf.write({
-      n: imgN, mul: 2 ** bitDepth, flLow: sLow, flUp: -sLow,
-      sLow, sUp, add: signed ? 0 : 1 << (bitDepth - 1), _pad: 0,
+      n: imgN,
+      mul: 2 ** bitDepth,
+      flLow: sLow,
+      flUp: -sLow,
+      sLow,
+      sUp,
+      add: signed ? 0 : 1 << (bitDepth - 1),
+      _pad: 0,
     });
     const cbind = root.unwrap(root.createBindGroup(convLayout, { C: p.convBuf, src: inbuf, dst: p.pixBuf }));
     const enc = device.createCommandEncoder();
     const pc = enc.beginComputePass();
-    pc.setPipeline(pipeConv); pc.setBindGroup(0, cbind);
+    pc.setPipeline(pipeConv);
+    pc.setBindGroup(0, cbind);
     pc.dispatchWorkgroups(Math.ceil(imgN / 64));
     pc.end();
     device.queue.submit([enc.finish()]);
@@ -315,9 +349,10 @@ export async function idwt97Gpu(input: DwtInput97, opts: Idwt97Opts = {}): Promi
  *  clamp, level shift. `Math.fround` mirrors the Rust f32 multiply. */
 export function irvToPixels(coeffs: Float32Array, bitDepth: number, signed: boolean): Int32Array {
   const mul = 2 ** bitDepth;
-  const up = (0x7fffffff >> (32 - bitDepth));
+  const up = 0x7fffffff >> (32 - bitDepth);
   const low = -(up + 1);
-  const flUp = -low, flLow = low;
+  const flUp = -low,
+    flLow = low;
   const half = 1 << (bitDepth - 1);
   const out = new Int32Array(coeffs.length);
   for (let i = 0; i < coeffs.length; i++) {

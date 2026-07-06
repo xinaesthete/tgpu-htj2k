@@ -3,8 +3,8 @@
 // The compute logic lives in `idwt53.ts` as a WGSL template that references
 // these via `tgpu.resolveWithContext`. To regenerate from WGSL:
 //   npx tgpu-gen <shader.wgsl> -o idwt53.gen.ts   (then trim to struct + layout)
-import tgpu from 'typegpu';
-import * as d from 'typegpu/data';
+import tgpu from "typegpu";
+import * as d from "typegpu/data";
 
 /* structs */
 export const Lvl = d.struct({
@@ -32,19 +32,19 @@ export const layout0 = tgpu.bindGroupLayout({
   },
   inbuf: {
     storage: (arrayLength: number) => d.arrayOf(d.i32, arrayLength),
-    access: 'readonly',
+    access: "readonly",
   },
   coeffs: {
     storage: (arrayLength: number) => d.arrayOf(d.i32, arrayLength),
-    access: 'readonly',
+    access: "readonly",
   },
   hbuf: {
     storage: (arrayLength: number) => d.arrayOf(d.i32, arrayLength),
-    access: 'mutable',
+    access: "mutable",
   },
   outbuf: {
     storage: (arrayLength: number) => d.arrayOf(d.i32, arrayLength),
-    access: 'mutable',
+    access: "mutable",
   },
   // (the global `scratch` binding was dropped — the optimised kernel lifts in
   // workgroup shared memory; see idwt53.ts)
