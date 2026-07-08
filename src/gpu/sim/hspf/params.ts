@@ -15,6 +15,8 @@ import type { ParamSpec, Params } from "../../graph/op";
 import type { HspfParams } from "./kernel";
 import { DEFAULT_FITNESS, type Vec4 } from "./math";
 
+export type { Params };
+
 const A = DEFAULT_FITNESS.A;
 const S = DEFAULT_FITNESS.S;
 const GENO = ["mm", "mp", "pm", "pp"] as const;

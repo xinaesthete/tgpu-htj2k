@@ -214,8 +214,186 @@ export function seedPfsa(scaffold: HspfScaffold, start: Vec4): Float32Array {
   return out;
 }
 
-/** Advance an HsPf `pfsa` state by `steps` fused steps on the GPU. The scaffold, neighbourhood
- *  and parameters are constant across the run; only the final `pfsa` (5 layers × n) is read back. */
+type Root = Pipe["root"];
+type StateBuffer = ReturnType<Root["createBuffer"]>;
+
+function clampBarriers(params: HspfParams): { list: ReadonlyArray<readonly [number, number, number, number]>; numBarriers: number } {
+  const list = params.barriers ?? [];
+  return { list, numBarriers: Math.min(list.length, MAX_BARRIERS) };
+}
+
+/** A stateful HsPf simulation whose genotype-frequency field stays resident on the GPU and advances
+ *  without reading back — the form the browser render loop wants (its state buffer is handed
+ *  straight to the renderer). `hspfStepsGpu` wraps this for one-shot, read-back use (tests). */
+export class HspfSim {
+  /** Cells per layer (width×height); layer `c` of the state buffer starts at index `c*n`. */
+  readonly n: number;
+  iteration = 0;
+
+  private nbhdBuf: GPUBuffer;
+  private nbhdCount: number;
+  private numBarriers: number;
+  private bg0: GPUBindGroup;
+  private src: StateBuffer;
+  private dst: StateBuffer;
+
+  private constructor(
+    readonly width: number,
+    readonly height: number,
+    private readonly device: GPUDevice,
+    private readonly root: Root,
+    private readonly pipeline: GPUComputePipeline,
+    private readonly bg0Layout: GPUBindGroupLayout,
+    private readonly bg1Layout: GPUBindGroupLayout,
+    private readonly paramsBuf: GPUBuffer,
+    private readonly fitnessBuf: GPUBuffer,
+    private readonly offspringBuf: GPUBuffer,
+    private readonly barriersBuf: GPUBuffer,
+    private readonly hbsBuf: GPUBuffer,
+    private readonly weightsBuf: GPUBuffer,
+    private readonly a: StateBuffer,
+    private readonly b: StateBuffer,
+    nbhdBuf: GPUBuffer,
+    nbhdCount: number,
+    numBarriers: number,
+  ) {
+    this.n = width * height;
+    this.nbhdBuf = nbhdBuf;
+    this.nbhdCount = nbhdCount;
+    this.numBarriers = numBarriers;
+    this.src = a;
+    this.dst = b;
+    this.bg0 = this.buildBg0();
+  }
+
+  static async create(
+    device: GPUDevice,
+    scaffold: HspfScaffold,
+    neighbourhood: Neighbourhood,
+    pfsa: Float32Array,
+    params: HspfParams = {},
+  ): Promise<HspfSim> {
+    const { width: w, height: h } = scaffold;
+    const n = w * h;
+    if (scaffold.hbs.length !== n || scaffold.weights.length !== n) throw new Error("hspf: scaffold length != w*h");
+    if (pfsa.length !== NUM_LAYERS * n) throw new Error("hspf: pfsa length != 5*w*h");
+
+    const fit = params.fitness ?? DEFAULT_FITNESS;
+    const { numBarriers } = clampBarriers(params);
+    const tbr = Math.min(1, Math.max(0, params.twoBiteRate ?? 0));
+    const { root, pipeline, bg0Layout, bg1Layout } = await getPipe(device);
+
+    const uni = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+    const sto = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+    const mk = (data: ArrayBufferView, use: number) => {
+      const buf = device.createBuffer({ size: data.byteLength, usage: use });
+      device.queue.writeBuffer(buf, 0, data as BufferSource);
+      return buf;
+    };
+
+    const paramsBuf = device.createBuffer({ size: 32, usage: uni });
+    device.queue.writeBuffer(paramsBuf, 0, packParams(w, h, neighbourhood.count, numBarriers, tbr));
+    const fitnessBuf = mk(new Float32Array([...fit.A, ...fit.S]), uni);
+    const offspringBuf = mk(packVec4Array(OFFSPRING, 16), uni);
+    const barriersBuf = mk(packVec4Array(params.barriers ?? [], MAX_BARRIERS), uni);
+    const nbhdBuf = mk(neighbourhood.data, sto);
+    const hbsBuf = mk(scaffold.hbs, sto);
+    const weightsBuf = mk(scaffold.weights, sto);
+    // State (ping-pong) buffers are tgpu-managed so readback uses tgpu's `.read()` — a raw staging
+    // `mapAsync` here trips Dawn-on-Node's exit-teardown segfault (see splatDensity notes).
+    const a = root.createBuffer(d.arrayOf(d.f32, NUM_LAYERS * n)).$usage("storage");
+    const b = root.createBuffer(d.arrayOf(d.f32, NUM_LAYERS * n)).$usage("storage");
+    device.queue.writeBuffer(root.unwrap(a), 0, pfsa as BufferSource);
+
+    return new HspfSim(w, h, device, root, pipeline, bg0Layout, bg1Layout, paramsBuf, fitnessBuf, offspringBuf, barriersBuf, hbsBuf, weightsBuf, a, b, nbhdBuf, neighbourhood.count, numBarriers);
+  }
+
+  private buildBg0(): GPUBindGroup {
+    return this.device.createBindGroup({
+      layout: this.bg0Layout,
+      entries: [
+        { binding: 0, resource: { buffer: this.paramsBuf } },
+        { binding: 1, resource: { buffer: this.fitnessBuf } },
+        { binding: 2, resource: { buffer: this.offspringBuf } },
+        { binding: 3, resource: { buffer: this.nbhdBuf } },
+        { binding: 4, resource: { buffer: this.hbsBuf } },
+        { binding: 5, resource: { buffer: this.weightsBuf } },
+        { binding: 6, resource: { buffer: this.barriersBuf } },
+      ],
+    });
+  }
+
+  /** Advance `steps` fused steps on the GPU. No readback — the state stays resident. */
+  step(steps = 1): void {
+    const groups = Math.ceil(this.n / 64);
+    for (let s = 0; s < steps; s++) {
+      const enc = this.device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(this.pipeline);
+      pass.setBindGroup(0, this.bg0);
+      pass.setBindGroup(
+        1,
+        this.device.createBindGroup({
+          layout: this.bg1Layout,
+          entries: [
+            { binding: 0, resource: { buffer: this.root.unwrap(this.src) } },
+            { binding: 1, resource: { buffer: this.root.unwrap(this.dst) } },
+          ],
+        }),
+      );
+      pass.dispatchWorkgroups(groups);
+      pass.end();
+      this.device.queue.submit([enc.finish()]);
+      [this.src, this.dst] = [this.dst, this.src];
+      this.iteration++;
+    }
+  }
+
+  /** The GPUBuffer holding the latest state (5 layers × n, layer-major) — for the renderer. */
+  currentStateBuffer(): GPUBuffer {
+    return this.root.unwrap(this.src);
+  }
+
+  /** Read the latest state back to the CPU (tgpu `.read()`, the Dawn-on-Node-safe path). */
+  async readback(): Promise<Float32Array> {
+    const read = (await this.src.read()) as ArrayLike<number>;
+    return Float32Array.from({ length: NUM_LAYERS * this.n }, (_, i) => read[i] ?? 0);
+  }
+
+  /** Reset the field to a fresh `pfsa` (5 layers × n) and restart the iteration count. */
+  reset(pfsa: Float32Array): void {
+    if (pfsa.length !== NUM_LAYERS * this.n) throw new Error("hspf: pfsa length != 5*w*h");
+    this.device.queue.writeBuffer(this.root.unwrap(this.a), 0, pfsa as BufferSource);
+    this.src = this.a;
+    this.dst = this.b;
+    this.iteration = 0;
+  }
+
+  /** Update the fitness matrix, two-bite rate, and barriers (uniform rewrites; no realloc). */
+  setParams(params: HspfParams): void {
+    const fit = params.fitness ?? DEFAULT_FITNESS;
+    const { numBarriers } = clampBarriers(params);
+    const tbr = Math.min(1, Math.max(0, params.twoBiteRate ?? 0));
+    this.numBarriers = numBarriers;
+    this.device.queue.writeBuffer(this.fitnessBuf, 0, new Float32Array([...fit.A, ...fit.S]) as BufferSource);
+    this.device.queue.writeBuffer(this.barriersBuf, 0, packVec4Array(params.barriers ?? [], MAX_BARRIERS) as BufferSource);
+    this.device.queue.writeBuffer(this.paramsBuf, 0, packParams(this.width, this.height, this.nbhdCount, numBarriers, tbr));
+  }
+
+  /** Replace the neighbourhood (e.g. after a spread-param change). Grows the buffer if needed and
+   *  rebuilds the background bind group. Preserve `twoBiteRate` by passing it in `params`. */
+  setNeighbourhood(neighbourhood: Neighbourhood, params: HspfParams = {}): void {
+    this.nbhdBuf = this.device.createBuffer({ size: neighbourhood.data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.nbhdBuf, 0, neighbourhood.data as BufferSource);
+    this.nbhdCount = neighbourhood.count;
+    const tbr = Math.min(1, Math.max(0, params.twoBiteRate ?? 0));
+    this.device.queue.writeBuffer(this.paramsBuf, 0, packParams(this.width, this.height, this.nbhdCount, this.numBarriers, tbr));
+    this.bg0 = this.buildBg0();
+  }
+}
+
+/** Advance an HsPf `pfsa` state by `steps` fused steps on the GPU and read the result back. Thin
+ *  one-shot wrapper over `HspfSim` for tests / batch use; the final `pfsa` (5 layers × n) returns. */
 export async function hspfStepsGpu(
   device: GPUDevice,
   scaffold: HspfScaffold,
@@ -224,76 +402,8 @@ export async function hspfStepsGpu(
   steps: number,
   params: HspfParams = {},
 ): Promise<Float32Array> {
-  const { width: w, height: h } = scaffold;
-  const n = w * h;
-  if (scaffold.hbs.length !== n || scaffold.weights.length !== n) throw new Error("hspf: scaffold length != w*h");
-  if (pfsa.length !== NUM_LAYERS * n) throw new Error("hspf: pfsa length != 5*w*h");
   if (steps < 1) return pfsa;
-
-  const fit = params.fitness ?? DEFAULT_FITNESS;
-  const barriers = params.barriers ?? [];
-  const numBarriers = Math.min(barriers.length, MAX_BARRIERS);
-  const tbr = Math.min(1, Math.max(0, params.twoBiteRate ?? 0));
-
-  const { root, pipeline, bg0Layout, bg1Layout } = await getPipe(device);
-
-  const uni = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
-  const mk = (data: ArrayBufferView, use: number) => {
-    const b = device.createBuffer({ size: data.byteLength, usage: use });
-    device.queue.writeBuffer(b, 0, data as BufferSource);
-    return b;
-  };
-
-  const paramsBuf = device.createBuffer({ size: 32, usage: uni });
-  device.queue.writeBuffer(paramsBuf, 0, packParams(w, h, neighbourhood.count, numBarriers, tbr));
-  const fitnessBuf = mk(new Float32Array([...fit.A, ...fit.S]), uni);
-  const offspringBuf = mk(packVec4Array(OFFSPRING, 16), uni);
-  const barriersBuf = mk(packVec4Array(barriers, MAX_BARRIERS), uni);
-  const nbhdBuf = mk(neighbourhood.data, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-  const hbsBuf = mk(scaffold.hbs, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-  const weightsBuf = mk(scaffold.weights, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-  // State (ping-pong) buffers are tgpu-managed so readback uses tgpu's `.read()` — a raw
-  // staging `mapAsync` here trips Dawn-on-Node's exit-teardown segfault (see splatDensity notes).
-  const pfsaA = root.createBuffer(d.arrayOf(d.f32, NUM_LAYERS * n)).$usage("storage");
-  const pfsaB = root.createBuffer(d.arrayOf(d.f32, NUM_LAYERS * n)).$usage("storage");
-  device.queue.writeBuffer(root.unwrap(pfsaA), 0, pfsa as BufferSource);
-
-  const bg0 = device.createBindGroup({
-    layout: bg0Layout,
-    entries: [
-      { binding: 0, resource: { buffer: paramsBuf } },
-      { binding: 1, resource: { buffer: fitnessBuf } },
-      { binding: 2, resource: { buffer: offspringBuf } },
-      { binding: 3, resource: { buffer: nbhdBuf } },
-      { binding: 4, resource: { buffer: hbsBuf } },
-      { binding: 5, resource: { buffer: weightsBuf } },
-      { binding: 6, resource: { buffer: barriersBuf } },
-    ],
-  });
-  const bg1 = (inBuf: GPUBuffer, outBuf: GPUBuffer) =>
-    device.createBindGroup({
-      layout: bg1Layout,
-      entries: [
-        { binding: 0, resource: { buffer: inBuf } },
-        { binding: 1, resource: { buffer: outBuf } },
-      ],
-    });
-  const groups = Math.ceil(n / 64);
-
-  let src = pfsaA;
-  let dst = pfsaB;
-  for (let step = 0; step < steps; step++) {
-    const enc = device.createCommandEncoder();
-    const pass = enc.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bg0);
-    pass.setBindGroup(1, bg1(root.unwrap(src), root.unwrap(dst)));
-    pass.dispatchWorkgroups(groups);
-    pass.end();
-    device.queue.submit([enc.finish()]);
-    [src, dst] = [dst, src];
-  }
-
-  const read = (await src.read()) as ArrayLike<number>;
-  return Float32Array.from({ length: NUM_LAYERS * n }, (_, i) => read[i] ?? 0);
+  const sim = await HspfSim.create(device, scaffold, neighbourhood, pfsa, params);
+  sim.step(steps);
+  return sim.readback();
 }
