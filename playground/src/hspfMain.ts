@@ -58,7 +58,7 @@ async function run(): Promise<void> {
   const renderer = await FieldRenderer.create(device, canvas);
 
   // --- controls ---
-  let playing = false;
+  let playing = true; // auto-play so the field is visibly evolving on load
   let channel = 3;
   let contours = true;
   let stepsPerFrame = 2;
@@ -80,6 +80,9 @@ async function run(): Promise<void> {
     speedval.textContent = String(stepsPerFrame);
   };
   syncLabels();
+  playpause.textContent = playing ? "Pause" : "Play";
+  sim.step(80); // warm-up so the map shows a developed pattern immediately, not a flat seed
+  genEl.textContent = String(sim.iteration);
 
   playpause.addEventListener("click", () => {
     playing = !playing;
