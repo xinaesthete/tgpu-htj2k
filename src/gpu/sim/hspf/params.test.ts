@@ -28,7 +28,7 @@ describe("toHspfConfig", () => {
       expect(close(cfg.hspf.fitness?.S[i] ?? 0, DEFAULT_FITNESS.S[i] ?? 0)).toBe(true);
     }
     expect(cfg.init).toEqual([0.9, 0, 0, 0.1]);
-    expect(cfg.neighbourhood).toEqual({ mapWidthInKm: 10000, maxDistanceInKm: 2000, concentration: 6, count: 5000 });
+    expect(cfg.neighbourhood).toEqual({ mapWidthInKm: 10000, maxDistanceInKm: 2000, concentration: 6, count: 1000 });
   });
 });
 

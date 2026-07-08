@@ -83,15 +83,20 @@ fn hspfStep(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var pf = vec4<f32>(pfsaIn[0u * n + bidx], pfsaIn[1u * n + bidx],
                        pfsaIn[2u * n + bidx], pfsaIn[3u * n + bidx]);
-    // two-bite recombination: sum_{g1,g2} pf[g1]*pf[g2]*offspring[g1*4+g2]
-    var two = vec4<f32>(0.0);
-    for (var r: u32 = 0u; r < 16u; r = r + 1u) {
-      let g1 = r / 4u;
-      let g2 = r % 4u;
-      two = two + (pf[g1] * pf[g2]) * offspring[r];
-    }
     let single = pf * fit;
-    let bite = (1.0 - tbr) * single + tbr * (two * fit);
+    // Two-bite recombination: sum_{g1,g2} pf[g1]*pf[g2]*offspring[g1*4+g2]. twoBiteRate (tbr) is a
+    // uniform, so this branch is uniform control flow — skip the 16-iteration term entirely when
+    // the two-bite rate is 0 (the default), a ~16x saving on the hot per-bite path.
+    var bite = single;
+    if (tbr > 0.0) {
+      var two = vec4<f32>(0.0);
+      for (var r: u32 = 0u; r < 16u; r = r + 1u) {
+        let g1 = r / 4u;
+        let g2 = r % 4u;
+        two = two + (pf[g1] * pf[g2]) * offspring[r];
+      }
+      bite = (1.0 - tbr) * single + tbr * (two * fit);
+    }
     acc = acc + weight * bite;
     denom = denom + weight * (bite.x + bite.y + bite.z + bite.w);
   }
@@ -305,7 +310,26 @@ export class HspfSim {
     const b = root.createBuffer(d.arrayOf(d.f32, NUM_LAYERS * n)).$usage("storage");
     device.queue.writeBuffer(root.unwrap(a), 0, pfsa as BufferSource);
 
-    return new HspfSim(w, h, device, root, pipeline, bg0Layout, bg1Layout, paramsBuf, fitnessBuf, offspringBuf, barriersBuf, hbsBuf, weightsBuf, a, b, nbhdBuf, neighbourhood.count, numBarriers);
+    return new HspfSim(
+      w,
+      h,
+      device,
+      root,
+      pipeline,
+      bg0Layout,
+      bg1Layout,
+      paramsBuf,
+      fitnessBuf,
+      offspringBuf,
+      barriersBuf,
+      hbsBuf,
+      weightsBuf,
+      a,
+      b,
+      nbhdBuf,
+      neighbourhood.count,
+      numBarriers,
+    );
   }
 
   private buildBg0(): GPUBindGroup {
@@ -383,7 +407,10 @@ export class HspfSim {
   /** Replace the neighbourhood (e.g. after a spread-param change). Grows the buffer if needed and
    *  rebuilds the background bind group. Preserve `twoBiteRate` by passing it in `params`. */
   setNeighbourhood(neighbourhood: Neighbourhood, params: HspfParams = {}): void {
-    this.nbhdBuf = this.device.createBuffer({ size: neighbourhood.data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.nbhdBuf = this.device.createBuffer({
+      size: neighbourhood.data.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
     this.device.queue.writeBuffer(this.nbhdBuf, 0, neighbourhood.data as BufferSource);
     this.nbhdCount = neighbourhood.count;
     const tbr = Math.min(1, Math.max(0, params.twoBiteRate ?? 0));

@@ -72,11 +72,11 @@ export const HSPF_PARAM_SPECS: ParamSpec[] = [
   {
     name: "spread.mosquitoCount",
     type: "int",
-    default: 5000,
+    default: 1000,
     min: 100,
     max: 25000,
     step: 100,
-    describe: "Number of sampled bites per cell",
+    describe: "Number of sampled bites per cell (Monte-Carlo gather; higher = smoother but slower)",
     tags: ["spread"],
   },
   {
