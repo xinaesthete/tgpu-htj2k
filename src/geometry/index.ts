@@ -5,6 +5,8 @@
 export type { Angle, AngleUnit } from "./angle";
 export { deg, isAngle, rad, turns, unitToRadians } from "./angle";
 export type { AngleLike } from "./angle-like";
+export type { Brep, BrepFace, BrepOptions } from "./bsp";
+export { brepToMesh, evaluateBrep } from "./bsp";
 export type { Expr, ExprLike } from "./expr";
 export { add, collectSpecs, constant, evalExpr, linear, mul, ramp, S, sub, THETA, toExpr, wgslExpr } from "./expr";
 export type { IsoMesh, Sdf, TessellateOptions as SdfTessellateOptions } from "./implicit";

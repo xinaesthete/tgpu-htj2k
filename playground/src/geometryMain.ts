@@ -7,7 +7,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { WebGPURenderer } from "three/webgpu";
-import type { IsoMesh } from "../../src/geometry";
+import { brepToMesh, evaluateBrep, type IsoMesh } from "../../src/geometry";
 import { SHAPES } from "./geometryShapes";
 
 const SPHERE_ORANGE = 0xff8a3c;
@@ -68,6 +68,7 @@ async function main(): Promise<void> {
 
   // ── UI ────────────────────────────────────────────────────────────────────────────────
   const shapeSel = document.getElementById("shape") as HTMLSelectElement;
+  const mesherSel = document.getElementById("mesher") as HTMLSelectElement;
   const resInput = document.getElementById("res") as HTMLInputElement;
   const resVal = document.getElementById("resv") as HTMLSpanElement;
   const sharpenBox = document.getElementById("sharpen") as HTMLInputElement;
@@ -86,16 +87,41 @@ async function main(): Promise<void> {
     const res = Number(resInput.value);
     resVal.textContent = String(res);
     const sharpen = sharpenBox.checked;
+    // Grid-DC options don't apply to the exact plane BSP; grey them out when it's selected.
+    const bsp = mesherSel.value === "bsp";
+    resInput.disabled = bsp;
+    sharpenBox.disabled = bsp;
+
+    let iso: IsoMesh;
+    let method: string;
     const t0 = performance.now();
-    const iso = shape.make().toMesh({ bounds: shape.bounds, res, sharpen });
+    if (bsp) {
+      try {
+        iso = brepToMesh(evaluateBrep(shape.make().node, { bounds: shape.bounds }));
+        method = "plane BSP (exact)";
+      } catch (e) {
+        // Non-polyhedral (curved/smooth) or coincident-face shapes: fall back to the grid so the view
+        // isn't empty, and say why the exact mesher declined.
+        iso = shape.make().toMesh({ bounds: shape.bounds, res, sharpen });
+        const ms = performance.now() - t0;
+        mesh.geometry.dispose();
+        mesh.geometry = toBufferGeometry(iso);
+        mesh.material = wireBox.checked ? wireMaterial : material;
+        stat.textContent = `BSP declined (${String(e).replace(/^Error:\s*bsp:\s*/, "")}) — showing surface nets · ${(iso.indices.length / 3).toLocaleString()} tris`;
+        return;
+      }
+    } else {
+      iso = shape.make().toMesh({ bounds: shape.bounds, res, sharpen });
+      method = sharpen ? "dual contouring" : "surface nets";
+    }
     const ms = performance.now() - t0;
     mesh.geometry.dispose();
     mesh.geometry = toBufferGeometry(iso);
     mesh.material = wireBox.checked ? wireMaterial : material;
-    const method = sharpen ? "dual contouring" : "surface nets";
     stat.textContent = `${iso.vertexCount.toLocaleString()} verts · ${(iso.indices.length / 3).toLocaleString()} tris · extracted in ${ms.toFixed(0)} ms (CPU ${method})`;
   }
   shapeSel.addEventListener("change", rebuild);
+  mesherSel.addEventListener("change", rebuild);
   resInput.addEventListener("input", rebuild);
   sharpenBox.addEventListener("change", rebuild);
   wireBox.addEventListener("change", () => {

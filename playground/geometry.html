@@ -30,9 +30,14 @@
       <canvas id="stage"></canvas>
       <div id="panel">
         <h1>Implicit CSG geometry</h1>
-        <p>Our <span class="k">implicit</span> kind — CSG via SDFs. The roofs (eave planes ∩) show
-        what <span class="k">dual contouring</span> buys: toggle Sharpen to see crisp facets vs a rounded blob.</p>
+        <p>Our <span class="k">implicit</span> kind — CSG via SDFs. Two meshers: the <span class="k">grid</span>
+        dual-contour (staircases non-axis planes) vs the exact <span class="k">plane BSP</span> (clean
+        lines, polyhedral only). Toggle Wireframe to compare the edges.</p>
         <label>Shape <select id="shape"></select></label>
+        <label>Mesher <select id="mesher">
+          <option value="dc">Dual contour (grid)</option>
+          <option value="bsp">Plane BSP (exact)</option>
+        </select></label>
         <label>Resolution <input id="res" type="range" min="24" max="80" step="4" value="56" /><span class="k" id="resv">56</span></label>
         <label><input id="sharpen" type="checkbox" checked /> Sharpen (dual contouring)</label>
         <label><input id="wire" type="checkbox" /> Wireframe</label>
