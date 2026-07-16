@@ -9,6 +9,8 @@ export type { Brep, BrepFace, BrepOptions } from "./bsp";
 export { brepEdges, brepToMesh, evaluateBrep, mergeCoplanar } from "./bsp";
 export type { Expr, ExprLike } from "./expr";
 export { add, collectSpecs, constant, evalExpr, linear, mul, ramp, S, sub, THETA, toExpr, wgslExpr } from "./expr";
+export type { AABB } from "./hybrid";
+export { aabbEmpty, aabbFinite, aabbOverlaps, boundsSdf, isPlanar, nonPlanarRegions, planarSkeleton, UNBOUNDED } from "./hybrid";
 export type { IsoMesh, Sdf, TessellateOptions as SdfTessellateOptions } from "./implicit";
 export { box, evalSdf, Implicit, normalSdf, plane, sdSceneWgsl, sphere, tessellateSdf, wgslSdf } from "./implicit";
 export type { Mat4 } from "./placement";
