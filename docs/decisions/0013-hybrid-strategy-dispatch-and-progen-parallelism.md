@@ -98,9 +98,15 @@ lighting rather than approximating it: a **custom lighting node** (run the physi
 the scene `lights([...])` with our geometric inputs — same BRDF, lights, and tone-mapping as the mesh,
 so they match by construction), or a **deferred G-buffer** (mesh and raymarch both write
 position/normal/albedo; one lighting pass covers all — more infrastructure, the clean answer at scale).
-The one genuinely harder part is **shadows**: *receiving* is a shadow-map sample at `pHit`; *casting*
-from raymarched geometry needs the shadow/depth passes to also march (the deferred route solves this
-uniformly). Target, not a blocker.
+**Shadows** are not a raymarch-special difficulty — *receiving* is a shadow-map sample at `pHit`, and
+*casting* is the general contract that **procedural geometry contributes a depth pass for shadow
+cameras**: a `customDepthMaterial` (directional/spot) and `customDistanceMaterial` (point) that
+reproduce the surface from an arbitrary camera. The one contract covers **horn** (the depth material
+shares the vertex transform), **terrain** (already done for the height-field in the psychogeo prior
+art), and the **raymarch** (the depth material shares the march). What keeps shadows attached to
+geometry is the repo's usual discipline — author the surface *once* and let the lit, depth, and
+distance materials all consume it (one definition, several lowerings, as with CPU-golden ==
+GPU-kernel). Expressing that contract generalises shadow-casting across every procedural kind at once.
 
 ### 7. Rust relevance tracks the algorithm (not an immediate priority)
 
