@@ -74,6 +74,7 @@ async function main(): Promise<void> {
   // ── UI ────────────────────────────────────────────────────────────────────────────────
   const shapeSel = document.getElementById("shape") as HTMLSelectElement;
   const mesherSel = document.getElementById("mesher") as HTMLSelectElement;
+  const mergeBox = document.getElementById("merge") as HTMLInputElement;
   const resInput = document.getElementById("res") as HTMLInputElement;
   const resVal = document.getElementById("resv") as HTMLSpanElement;
   const sharpenBox = document.getElementById("sharpen") as HTMLInputElement;
@@ -106,24 +107,26 @@ async function main(): Promise<void> {
     const res = Number(resInput.value);
     resVal.textContent = String(res);
     const sharpen = sharpenBox.checked;
-    // Grid-DC options don't apply to the exact plane BSP; grey them out when it's selected.
+    // The merge toggle only applies to the BSP; grid-DC options only to the grid. Grey out the inapplicable.
     const bsp = mesherSel.value === "bsp";
     resInput.disabled = bsp;
     sharpenBox.disabled = bsp;
+    mergeBox.disabled = !bsp;
 
     let iso: IsoMesh;
     let method: string;
     const t0 = performance.now();
     if (bsp) {
       try {
-        const brep = mergeCoplanar(evaluateBrep(shape.make().node, { bounds: shape.bounds }));
+        const raw = evaluateBrep(shape.make().node, { bounds: shape.bounds });
+        const brep = mergeBox.checked ? mergeCoplanar(raw) : raw;
         iso = brepToMesh(brep);
         edges.geometry.dispose();
         const eg = new THREE.BufferGeometry();
         eg.setAttribute("position", new THREE.BufferAttribute(brepEdges(brep), 3));
         edges.geometry = eg;
         hasEdges = true;
-        method = `plane BSP (exact) · ${brep.faces.length} faces`;
+        method = `plane BSP (exact) · ${brep.faces.length} faces${mergeBox.checked ? "" : " (raw)"}`;
       } catch (e) {
         // Non-polyhedral (curved/smooth) shapes: fall back to the grid so the view isn't empty, and
         // say why the exact mesher declined.
@@ -148,6 +151,7 @@ async function main(): Promise<void> {
   }
   shapeSel.addEventListener("change", rebuild);
   mesherSel.addEventListener("change", rebuild);
+  mergeBox.addEventListener("change", rebuild);
   resInput.addEventListener("input", rebuild);
   sharpenBox.addEventListener("change", rebuild);
   wireBox.addEventListener("change", applyWire);
