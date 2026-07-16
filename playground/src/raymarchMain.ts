@@ -1,12 +1,9 @@
-// Implicit RAYMARCH view — the same `sdScene` (our WGSL) rendered exactly per-pixel: sharp CSG edges
-// AND smooth curves, no meshing, no staircase. Built as a HYBRID pass in a three.js scene: it shares
-// the depth buffer with real mesh geometry (a ground plane + a cube), so the raymarched surface and
-// the meshes mutually occlude.
-//
-// Boundary (WebGPU-first / TSL-boundary principle): the SDF stays in OUR WGSL — embedded via `wgslFn`
-// (constants baked, `Implicit.toWgsl({ bakeConstants: true })`). Only the ray loop / shading / depth
-// plumbing is TSL, which is presentation, not geometry. Self-lit (shadertoy-ish); feeding three's PBR
-// fragment stage is a later stretch.
+// Hybrid decomposition, rendered (ADR-0013). One implicit model — a plane-based house smooth-unioned
+// with a noise-displaced growth — is split by `nonPlanarRegions`: the planar skeleton (the house) is
+// meshed exactly by the plane BSP and lit as normal three.js PBR; the non-planar region (the growth
+// and the blend seam around it) is raymarched, confined to its reported box, and composited against
+// the mesh through the shared depth buffer. Neither renderer sees the other's geometry — they meet at
+// the box edge, where the field is still the bare house, so the seam is invisible.
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import {
@@ -23,89 +20,111 @@ import {
   If,
   Loop,
   max,
+  min,
+  mix,
   normalize,
   positionWorld,
   struct,
+  uniform,
   vec3,
   vec4,
   viewZToPerspectiveDepth,
   wgslFn,
 } from "three/tsl";
 import { MeshBasicNodeMaterial, WebGPURenderer } from "three/webgpu";
-import { SHAPES, type Shape } from "./geometryShapes";
+import {
+  type AABB,
+  aabbFinite,
+  brepToMesh,
+  evaluateBrep,
+  type Implicit,
+  mergeCoplanar,
+  nonPlanarRegions,
+  planarSkeleton,
+} from "../../src/geometry";
+import { hybridGrowth, hybridHouse } from "./geometryShapes";
 
 const RayResult = struct({ color: "vec4", depth: "float" });
+const BOUNDS = 1.8;
+// The raymarch drives the noise animation; `uNoiseTime` in the codegen'd field reads this each frame.
+const uTime = uniform(0);
 
-/** Build the raymarch material for a shape: an unlit node material whose fragment sphere-traces our
- *  `sdScene`, self-shades, and writes the hit's clip depth so it composites with mesh geometry. */
-function makeRaymarchMaterial(shape: Shape): MeshBasicNodeMaterial {
-  // Our SDF, constants baked → self-contained WGSL. `sdField` is the wgslFn entry (helpers below it).
+/** A raymarch material for one non-planar region: sphere-traces the FULL model, but only within `box`
+ *  (a ray-box slab bounds the march), and shades to match the meshed house so the two read as one
+ *  surface across the smooth-union seam. */
+function regionMaterial(model: Implicit, box: AABB): MeshBasicNodeMaterial {
   const sdField = wgslFn(`
-fn sdField(p: vec3<f32>) -> f32 { return sdScene(p); }
-${shape.make().toWgsl({ bakeConstants: true })}
+fn sdField(p: vec3<f32>, t: f32) -> f32 { uNoiseTime = t; return sdScene(p); }
+${model.toWgsl({ bakeConstants: true })}
 `);
-
+  const bmin = vec3(box.min[0], box.min[1], box.min[2]);
+  const bmax = vec3(box.max[0], box.max[1], box.max[2]);
   const mat = new MeshBasicNodeMaterial();
-  mat.side = THREE.DoubleSide; // proxy box faces generate fragments over the shape from any angle
 
   const march = Fn(() => {
     const ro = cameraPosition;
     const rd = normalize(positionWorld.sub(cameraPosition));
 
-    // Sphere-trace. `relax` (<1) keeps steps safe where the CSG field over-estimates distance
-    // (subtract / smooth regions), and a small minimum step stops grazing rays from crawling to a
-    // halt before they reach the surface (the glancing-angle gaps). On a hit we interpolate the exact
-    // zero-crossing between the last two samples rather than snapping to the step — that removes the
-    // depth quantisation that bands along ridge-lines.
-    const relax = float(0.9);
+    // Ray vs the region box (slab test) → the [tNear, tFar] the march is allowed to live in. Outside
+    // it the field is the bare (meshed) house, so there is nothing here to draw.
+    const t1 = bmin.sub(ro).div(rd);
+    const t2 = bmax.sub(ro).div(rd);
+    const tmn = min(t1, t2);
+    const tmx = max(t1, t2);
+    const tNear = max(max(tmn.x, tmn.y), tmn.z);
+    const tFar = min(min(tmx.x, tmx.y), tmx.z);
+    Discard(tNear.greaterThan(tFar)); // ray misses the box
+
+    // Under-relaxed sphere-trace (the noise/blend field over-estimates distance), confined to the box.
+    const relax = float(0.85);
     const hitEps = float(0.0012);
-    const t = float(0).toVar();
-    const tPrev = float(0).toVar();
+    const t = max(tNear, float(0)).toVar();
+    const tPrev = t.toVar();
     const dPrev = float(1e9).toVar();
     const hit = float(0).toVar();
     const tHit = float(0).toVar();
-    Loop(200, () => {
+    Loop(160, () => {
       const p = ro.add(rd.mul(t));
-      const d = sdField({ p });
+      const d = sdField({ p, t: uTime });
       If(d.lessThan(hitEps), () => {
         hit.assign(1);
-        // Zero-crossing between (tPrev, dPrev) and (t, d) — handles under- and over-shoot.
         const f = dPrev.div(max(dPrev.sub(d), float(1e-5)));
         tHit.assign(tPrev.add(t.sub(tPrev).mul(f)));
         Break();
       });
       tPrev.assign(t);
       dPrev.assign(d);
-      t.addAssign(max(d.mul(relax), float(0.0012)));
-      If(t.greaterThan(26), () => {
+      t.addAssign(max(d.mul(relax), float(0.002)));
+      If(t.greaterThan(tFar), () => {
         Break();
       });
     });
-    Discard(hit.equal(0)); // no hit → let the mesh scene / background show
+    Discard(hit.equal(0)); // ray crossed the box without hitting → let the mesh / background show
     const pHit = ro.add(rd.mul(tHit));
 
-    // Normal by the tetrahedral gradient of the field.
-    const e = float(0.0016);
+    // Tetrahedral gradient normal.
+    const e = float(0.0015);
     const k0 = vec3(1, -1, -1);
     const k1 = vec3(-1, -1, 1);
     const k2 = vec3(-1, 1, -1);
     const k3 = vec3(1, 1, 1);
     const n = normalize(
       k0
-        .mul(sdField({ p: pHit.add(k0.mul(e)) }))
-        .add(k1.mul(sdField({ p: pHit.add(k1.mul(e)) })))
-        .add(k2.mul(sdField({ p: pHit.add(k2.mul(e)) })))
-        .add(k3.mul(sdField({ p: pHit.add(k3.mul(e)) }))),
+        .mul(sdField({ p: pHit.add(k0.mul(e)), t: uTime }))
+        .add(k1.mul(sdField({ p: pHit.add(k1.mul(e)), t: uTime })))
+        .add(k2.mul(sdField({ p: pHit.add(k2.mul(e)), t: uTime })))
+        .add(k3.mul(sdField({ p: pHit.add(k3.mul(e)), t: uTime }))),
     );
 
-    // Self-lit shade: a key light + hemisphere sky/ground + a little ambient.
-    const lig = normalize(vec3(0.5, 0.85, 0.35));
-    const dif = clamp(dot(n, lig), 0, 1);
+    // Shade to approximate the house's PBR (key light + hemisphere), so the raymarched growth reads as
+    // the same material as the meshed house it grows out of.
+    const base = vec3(0.78, 0.7, 0.6); // ≈ 0xc7b299
+    const lig = normalize(vec3(3, 5, 2)); // matches the scene key light direction
+    const dif = clamp(dot(n, lig), 0, 1).mul(1.15);
     const hemi = clamp(n.y.mul(0.5).add(0.5), 0, 1);
-    const base = vec3(0.95, 0.55, 0.22);
-    const col = base.mul(dif.mul(vec3(1.0, 0.96, 0.86)).add(0.12)).add(base.mul(vec3(0.16, 0.2, 0.32)).mul(hemi));
+    const amb = mix(vec3(0.12, 0.09, 0.06), vec3(0.62, 0.7, 1.0), hemi).mul(0.5);
+    const col = base.mul(dif.add(amb));
 
-    // Depth: project the world hit to clip depth so the hardware depth test composites with meshes.
     const hitViewZ = cameraViewMatrix.mul(vec4(pHit, 1)).z;
     const depth = viewZToPerspectiveDepth(hitViewZ, cameraNear, cameraFar);
     return RayResult(vec4(col, 1), depth);
@@ -114,6 +133,23 @@ ${shape.make().toWgsl({ bakeConstants: true })}
   mat.colorNode = march.get("color");
   mat.depthNode = march.get("depth");
   return mat;
+}
+
+/** Build a BufferGeometry from a plane-BSP mesh of a planar Sdf. */
+function meshOf(node: Parameters<typeof evaluateBrep>[0]): THREE.BufferGeometry {
+  const iso = brepToMesh(mergeCoplanar(evaluateBrep(node, { bounds: BOUNDS })));
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(iso.positions, 3));
+  g.setAttribute("normal", new THREE.BufferAttribute(iso.normals, 3));
+  g.setIndex(new THREE.BufferAttribute(iso.indices, 1));
+  return g;
+}
+
+/** Clamp an (possibly unbounded) region to a proxy-sizeable box. */
+function proxyBox(r: AABB): AABB {
+  if (aabbFinite(r)) return r;
+  const s = BOUNDS * 1.5;
+  return { min: [-s, -s, -s], max: [s, s, s] };
 }
 
 function fail(msg: string): void {
@@ -143,12 +179,11 @@ async function main(): Promise<void> {
   scene.background = new THREE.Color(0x0b1020);
 
   const camera = new THREE.PerspectiveCamera(45, 1, 0.02, 100);
-  camera.position.set(4.4, 3.4, 5.0);
+  camera.position.set(3.4, 2.2, 4.1);
   const controls = new OrbitControls(camera, canvas);
   controls.enableDamping = true;
-  controls.target.set(0, 0.3, 0.2);
+  controls.target.set(0, 0.5, 0);
 
-  // Real mesh geometry (lit by three), to prove the raymarch coexists + shares depth.
   scene.add(new THREE.HemisphereLight(0x9fb4ff, 0x20160c, 1.1));
   const key = new THREE.DirectionalLight(0xffffff, 2.2);
   key.position.set(3, 5, 2);
@@ -158,38 +193,52 @@ async function main(): Promise<void> {
   ground.rotation.x = -Math.PI / 2;
   scene.add(ground);
 
-  const cube = new THREE.Mesh(
-    new THREE.BoxGeometry(0.75, 0.75, 0.75),
-    new THREE.MeshStandardMaterial({ color: 0x37c6c0, roughness: 0.4, metalness: 0.1 }),
-  );
-  cube.position.set(0.35, 0.42, 0.55); // straddles the front wall: back half buried, front half pokes out
-  scene.add(cube);
+  // The one model: a plane-based house smooth-unioned with a noise growth. `k` blends the growth into
+  // the roof rather than letting it merely rest on it.
+  const model = hybridHouse().smoothUnion(hybridGrowth(), 0.16);
 
-  // The raymarch proxy: a box that just needs to cover the shape on screen; its fragments run the march.
-  const proxy = new THREE.Mesh(new THREE.BoxGeometry(4, 4, 4), makeRaymarchMaterial(SHAPES[0] as Shape));
-  proxy.position.set(0, 0, 0);
-  scene.add(proxy);
+  // Mesh the planar skeleton (the house) with the BSP; a slight polygon offset lets the region raymarch
+  // win the depth test where the two overlap inside the box.
+  const skel = planarSkeleton(model.node);
+  if (!skel) {
+    fail("Model has no planar skeleton to mesh.");
+    return;
+  }
+  const houseMat = new THREE.MeshStandardMaterial({ color: 0xc7b299, roughness: 0.85, metalness: 0.0 });
+  houseMat.polygonOffset = true;
+  houseMat.polygonOffsetFactor = 1;
+  houseMat.polygonOffsetUnits = 1;
+  const house = new THREE.Mesh(meshOf(skel), houseMat);
+  scene.add(house);
+
+  // One raymarch proxy per non-planar region — sized to the region box; its fragments march the model.
+  const regions = nonPlanarRegions(model.node);
+  const proxies: THREE.Mesh[] = [];
+  const helpers: THREE.Box3Helper[] = [];
+  for (const r of regions) {
+    const b = proxyBox(r);
+    const size: [number, number, number] = [b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]];
+    const proxy = new THREE.Mesh(new THREE.BoxGeometry(size[0], size[1], size[2]), regionMaterial(model, b));
+    proxy.position.set((b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, (b.min[2] + b.max[2]) / 2);
+    scene.add(proxy);
+    proxies.push(proxy);
+    const helper = new THREE.Box3Helper(
+      new THREE.Box3(new THREE.Vector3(...b.min), new THREE.Vector3(...b.max)),
+      new THREE.Color(0xff8a3c),
+    );
+    helper.visible = false;
+    scene.add(helper);
+    helpers.push(helper);
+  }
 
   // ── UI ────────────────────────────────────────────────────────────────────────────────
-  const shapeSel = document.getElementById("shape") as HTMLSelectElement;
-  const cubeBox = document.getElementById("cube") as HTMLInputElement;
-  SHAPES.forEach((s, i) => {
-    const o = document.createElement("option");
-    o.value = String(i);
-    o.textContent = s.name;
-    shapeSel.appendChild(o);
+  const houseBox = document.getElementById("house") as HTMLInputElement;
+  const regionBox = document.getElementById("region") as HTMLInputElement;
+  houseBox.addEventListener("change", () => {
+    house.visible = houseBox.checked;
   });
-  shapeSel.selectedIndex = 0;
-  function applyShape(): void {
-    const shape = SHAPES[Number(shapeSel.value)] ?? SHAPES[0];
-    if (!shape) return;
-    proxy.material.dispose();
-    proxy.material = makeRaymarchMaterial(shape);
-  }
-  shapeSel.addEventListener("change", applyShape);
-  applyShape();
-  cubeBox.addEventListener("change", () => {
-    cube.visible = cubeBox.checked;
+  regionBox.addEventListener("change", () => {
+    for (const h of helpers) h.visible = regionBox.checked;
   });
 
   function resize(): void {
@@ -202,7 +251,9 @@ async function main(): Promise<void> {
   window.addEventListener("resize", resize);
   resize();
 
+  const start = performance.now();
   renderer.setAnimationLoop(() => {
+    uTime.value = (performance.now() - start) / 1000; // seconds → drifts the noise domain
     controls.update();
     renderer.render(scene, camera);
   });

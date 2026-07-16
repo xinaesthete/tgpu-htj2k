@@ -28,11 +28,13 @@
     <div id="app">
       <canvas id="stage"></canvas>
       <div id="panel">
-        <h1>Implicit raymarch — hybrid pass</h1>
-        <p>Our <span class="k">sdScene</span> raymarched (exact edges + curves, no mesh) as a pass in a
-        three.js scene with real mesh geometry (ground + <span class="k">cyan cube</span>), sharing depth.</p>
-        <label>Shape <select id="shape"></select></label>
-        <label><input id="cube" class="chk" type="checkbox" checked /> Show mesh cube (test occlusion)</label>
+        <h1>Hybrid decomposition</h1>
+        <p>One model — a house <span class="k">smooth-unioned</span> with a noise growth — split
+        automatically: the planar skeleton is <span class="k">BSP-meshed</span> (three.js PBR), the
+        non-planar region is <span class="k">raymarched</span> in its reported box. They share one depth
+        buffer, so the growth blends into the roof. The noise drifts over time.</p>
+        <label><input id="house" class="chk" type="checkbox" checked /> Show meshed house</label>
+        <label><input id="region" class="chk" type="checkbox" /> Show non-planar region box</label>
       </div>
       <div id="err"></div>
     </div>

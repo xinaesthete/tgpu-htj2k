@@ -38,6 +38,20 @@ function gabledBox(cx: number, cz: number, hx: number, hz: number, eaveY: number
     : body.intersect(roofPlane([1, b, 0], [cx + hx, eaveY, cz])).intersect(roofPlane([-1, b, 0], [cx - hx, eaveY, cz]));
 }
 
+/** The meshed half of the hybrid demo: a plain ridged hip-roofed house the plane BSP renders exactly
+ *  (base on the ground, ridge along X). Shared so the raymarch view can mesh the same house the mesh
+ *  view shows. */
+export function hybridHouse(): Implicit {
+  return roofedBox(0, 0, 0.6, 0.45, 0.62, 1.0); // footprint 1.2×0.9, eaves at 0.62, ridge ~1.07
+}
+
+/** The raymarched half: a lumpy, noise-displaced blob sitting on the house roof — the organic ornament
+ *  that breaks the BSP (ADR-0013), so it is raymarched and composited against the meshed house by
+ *  depth. The raymarch animates the noise domain over time. */
+export function hybridGrowth(): Implicit {
+  return sphere(0.28).displace(0.19, 3.6).translate(0.34, 1.0, 0.16);
+}
+
 export interface Shape {
   name: string;
   /** Half-extent of the mesh sampling cube (mesh view only; the raymarch view ignores it). */
@@ -87,6 +101,9 @@ export const SHAPES: Shape[] = [
       return g;
     },
   },
+  // The raymarched growth on its own (the hybrid view pairs it with a meshed house). In the mesh view
+  // the grid dual-contour tessellates it — a lumpy blob — since the BSP can't (noise isn't planar).
+  { name: "Alien growth (noise)", bounds: 1.6, make: () => hybridGrowth() },
   { name: "Cube ∖ sphere (bite)", bounds: 1.5, make: () => box(1).subtract(sphere(1.22)) },
   { name: "Sphere ∩ cube (lens-box)", bounds: 1.2, make: () => sphere(1.1).intersect(box(0.85)) },
   {
