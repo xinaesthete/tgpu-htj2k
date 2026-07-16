@@ -25,11 +25,14 @@
 // exact SDF is still the in/out oracle: the ±ε classification offset crosses every coincident plane at
 // once, so it reports the true just-inside/just-outside of the whole stack.
 //
+// `mergeCoplanar` then fuses each plane's abutting fragments back into their maximal outlines (outer
+// loop + holes), which halves face counts and — via `brepEdges` — yields clean architectural line-work
+// (no fan diagonals, no interior split-edges).
+//
 // Scope: generators `box`/`plane`; booleans `union`/`intersect`/`subtract`; domain transforms
 // `translate`/`scale` (uniform, positive). Curved/smooth ops (`sphere`/`smoothUnion`) are rejected with
-// a clear error — they route to grid-DC or raymarch. NOT yet done (correctness unaffected): merging
-// coplanar-*adjacent* faces into one (a minimality pass — a plane split by a crossing plane yields two
-// abutting faces) and octree localisation (pure acceleration).
+// a clear error — they route to grid-DC or raymarch. NOT yet done (correctness unaffected): octree
+// localisation (pure acceleration — the current split is O(planes²), instant at architectural scale).
 
 import type { Expr } from "./expr";
 import { evalExpr } from "./expr";
@@ -200,10 +203,15 @@ function seedQuad(plane: Plane, half: number): Vec3[] {
 
 // ── boundary evaluation ───────────────────────────────────────────────────────────────
 
-/** A face of the evaluated boundary: a convex polygon (CCW around `normal`), its outward `normal`,
- *  and provenance — which primitive (`primId`) and which of its planes (`planeId`) produced it. */
+/** A face of the evaluated boundary. `poly` is the outer loop (CCW around `normal`) — convex as
+ *  produced by `evaluateBrep`, possibly non-convex after `mergeCoplanar`. `holes` (merged faces only)
+ *  are inner loops (CW). `parts` (merged faces only) are the convex fragments the face was assembled
+ *  from, retained so triangulation stays trivial (fan each part) without re-meshing a non-convex/holed
+ *  polygon. Provenance: which primitive (`primId`) and canonical plane (`planeId`) produced it. */
 export interface BrepFace {
   poly: Vec3[];
+  holes?: Vec3[][];
+  parts?: Vec3[][];
   normal: Vec3;
   primId: number;
   planeId: number;
@@ -302,23 +310,26 @@ export function evaluateBrep(node: Sdf, opts: BrepOptions = {}): Brep {
   return { faces };
 }
 
-/** Triangulate a Brep into the interop `IsoMesh` form — one flat-shaded fan per convex face, so the
- *  clean facets read as clean facets. `facePrim[t]` gives the source `primId` of triangle `t` (the
- *  ADR-0012 provenance channel; `undefined`-free, one entry per triangle). */
+/** Triangulate a Brep into the interop `IsoMesh` form — one flat-shaded fan per convex piece, so the
+ *  clean facets read as clean facets. For a merged face the convex `parts` are fanned (a non-convex or
+ *  holed outer loop can't be fanned directly); raw faces fan their convex `poly`. `facePrim[t]` gives
+ *  the source `primId` of triangle `t` (the ADR-0012 provenance channel; one entry per triangle). */
 export function brepToMesh(brep: Brep): IsoMesh & { facePrim: Uint32Array } {
   const positions: number[] = [];
   const normals: number[] = [];
   const indices: number[] = [];
   const facePrim: number[] = [];
   for (const face of brep.faces) {
-    const base = positions.length / 3;
-    for (const v of face.poly) {
-      positions.push(v[0], v[1], v[2]);
-      normals.push(face.normal[0], face.normal[1], face.normal[2]);
-    }
-    for (let i = 1; i + 1 < face.poly.length; i++) {
-      indices.push(base, base + i, base + i + 1);
-      facePrim.push(face.primId);
+    for (const piece of face.parts ?? [face.poly]) {
+      const base = positions.length / 3;
+      for (const v of piece) {
+        positions.push(v[0], v[1], v[2]);
+        normals.push(face.normal[0], face.normal[1], face.normal[2]);
+      }
+      for (let i = 1; i + 1 < piece.length; i++) {
+        indices.push(base, base + i, base + i + 1);
+        facePrim.push(face.primId);
+      }
     }
   }
   return {
@@ -328,4 +339,213 @@ export function brepToMesh(brep: Brep): IsoMesh & { facePrim: Uint32Array } {
     vertexCount: positions.length / 3,
     facePrim: Uint32Array.from(facePrim),
   };
+}
+
+// ── coplanar-adjacent merge ─────────────────────────────────────────────────────────────
+//
+// `evaluateBrep` visits each canonical plane once but still emits a *separate* face wherever a crossing
+// plane split the seed — so the union of two abutting boxes has its shared top in two pieces, and every
+// face's interior split-edges + fan diagonals clutter a wireframe. This pass fuses the coplanar,
+// co-oriented fragments of each plane back into their maximal outlines by **directed-edge cancellation**:
+// on a plane, every interior edge between two kept fragments appears as an opposite-directed pair (the
+// arrangement has no T-junctions — all fragments see the same cut lines), so cancelling matched pairs
+// leaves exactly the region's outer boundary (CCW) and any hole boundaries (CW). The convex fragments
+// are retained as `parts` for triangulation; the outlines drive clean feature-edge line-work.
+
+type P2 = [number, number];
+
+/** An in-plane orthonormal basis `(u, v)` for a unit normal `n`, so `(dot(p,u), dot(p,v))` projects to
+ *  2D and `(u × v) = n` keeps CCW-in-2D the same as CCW-around-n. */
+function basisFor(n: Vec3): { u: Vec3; v: Vec3 } {
+  const ref: Vec3 = Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  const u = norm(cross(n, ref));
+  return { u, v: cross(n, u) };
+}
+
+const signedArea2 = (loop: P2[]): number => {
+  let a = 0;
+  for (let i = 0; i < loop.length; i++) {
+    const p = loop[i] as P2;
+    const q = loop[(i + 1) % loop.length] as P2;
+    a += p[0] * q[1] - q[0] * p[1];
+  }
+  return a / 2;
+};
+
+/** Drop vertices whose two incident edges are collinear — so a straight run that was split where two
+ *  fragments abutted collapses back to one edge (the difference between 16 and 12 edges on a fused box). */
+function dropCollinear(loop: Vec3[], tol = 1e-6): Vec3[] {
+  const out: Vec3[] = [];
+  for (let i = 0; i < loop.length; i++) {
+    const a = loop[(i - 1 + loop.length) % loop.length] as Vec3;
+    const b = loop[i] as Vec3;
+    const c = loop[(i + 1) % loop.length] as Vec3;
+    if (len(cross(norm(sub(b, a)), norm(sub(c, b)))) > tol) out.push(b);
+  }
+  return out.length >= 3 ? out : loop;
+}
+
+/** Even-odd point-in-polygon in 2D. */
+function pointInLoop2(pt: P2, loop: P2[]): boolean {
+  let inside = false;
+  for (let i = 0, j = loop.length - 1; i < loop.length; j = i++) {
+    const a = loop[i] as P2;
+    const b = loop[j] as P2;
+    if (a[1] > pt[1] !== b[1] > pt[1] && pt[0] < ((b[0] - a[0]) * (pt[1] - a[1])) / (b[1] - a[1]) + a[0]) inside = !inside;
+  }
+  return inside;
+}
+
+/** Trace the boundary loops of a planar region from its surviving directed edges. Balanced in/out
+ *  degree guarantees closed loops; at a pinch vertex the next edge is the most-clockwise turn from the
+ *  incoming direction, which keeps the interior on the left (outer loops come out CCW, holes CW). */
+function traceLoops(edges: [number, number][], pos2: P2[]): number[][] {
+  const outFrom = new Map<number, number[]>();
+  edges.forEach((e, idx) => {
+    const a = outFrom.get(e[0]);
+    if (a) a.push(idx);
+    else outFrom.set(e[0], [idx]);
+  });
+  const used = new Array(edges.length).fill(false);
+  const loops: number[][] = [];
+  for (let s = 0; s < edges.length; s++) {
+    if (used[s]) continue;
+    const start = (edges[s] as [number, number])[0];
+    const loop: number[] = [];
+    let cur = s;
+    let guard = 0;
+    while (cur !== -1 && !used[cur] && guard++ < 1e6) {
+      used[cur] = true;
+      const [a, b] = edges[cur] as [number, number];
+      loop.push(a);
+      if (b === start) break;
+      const inx = (pos2[b] as P2)[0] - (pos2[a] as P2)[0];
+      const iny = (pos2[b] as P2)[1] - (pos2[a] as P2)[1];
+      let best = -1;
+      let bestTurn = Number.POSITIVE_INFINITY;
+      for (const oi of outFrom.get(b) ?? []) {
+        if (used[oi]) continue;
+        const c = (edges[oi] as [number, number])[1];
+        const ox = (pos2[c] as P2)[0] - (pos2[b] as P2)[0];
+        const oy = (pos2[c] as P2)[1] - (pos2[b] as P2)[1];
+        // Clockwise turn angle from the incoming direction, in [0, 2π); smallest = sharpest right.
+        let ang = Math.atan2(inx * oy - iny * ox, inx * ox + iny * oy);
+        if (ang < 0) ang += 2 * Math.PI;
+        if (ang < bestTurn) {
+          bestTurn = ang;
+          best = oi;
+        }
+      }
+      cur = best;
+    }
+    if (loop.length >= 3) loops.push(loop);
+  }
+  return loops;
+}
+
+/** Fuse each plane's coplanar, co-oriented fragments into maximal outlines (outer loop + holes),
+ *  retaining the convex fragments as `parts`. Halves face counts and, with {@link brepEdges}, yields
+ *  clean architectural line-work instead of split-edge/fan clutter. Idempotent-ish: single-fragment
+ *  planes pass through unchanged (still gaining `parts` for uniform downstream handling). */
+export function mergeCoplanar(brep: Brep, eps = 1e-6): Brep {
+  // Group by canonical plane AND orientation (a plane can bound the solid from either side in disjoint
+  // regions; those must not be fused).
+  const groups = new Map<string, BrepFace[]>();
+  for (const f of brep.faces) {
+    const key = `${f.planeId}:${f.normal.map((x) => (x >= 0 ? 1 : 0)).join("")}`;
+    const g = groups.get(key);
+    if (g) g.push(f);
+    else groups.set(key, [f]);
+  }
+
+  const faces: BrepFace[] = [];
+  for (const group of groups.values()) {
+    const g0 = group[0];
+    if (!g0) continue;
+    const { u, v } = basisFor(g0.normal);
+    const project = (p: Vec3): P2 => [dot(p, u), dot(p, v)];
+
+    // Weld the group's vertices (coincident up to eps) to shared ids.
+    const ids = new Map<string, number>();
+    const pos3: Vec3[] = [];
+    const pos2: P2[] = [];
+    const idOf = (p: Vec3): number => {
+      const q = project(p);
+      const k = `${Math.round(q[0] / eps)},${Math.round(q[1] / eps)}`;
+      const e = ids.get(k);
+      if (e !== undefined) return e;
+      const id = pos3.length;
+      ids.set(k, id);
+      pos3.push(p);
+      pos2.push(q);
+      return id;
+    };
+
+    // Net directed-edge counts; an interior edge (opposite pair) nets to zero.
+    const net = new Map<string, number>();
+    for (const f of group) {
+      const loop = f.poly.map(idOf);
+      for (let i = 0; i < loop.length; i++) {
+        const a = loop[i] as number;
+        const b = loop[(i + 1) % loop.length] as number;
+        net.set(`${a},${b}`, (net.get(`${a},${b}`) ?? 0) + 1);
+      }
+    }
+    const survivors: [number, number][] = [];
+    for (const [k, c] of net) {
+      const parts = k.split(",");
+      const a = Number(parts[0]);
+      const b = Number(parts[1]);
+      const back = net.get(`${b},${a}`) ?? 0;
+      for (let t = 0; t < c - back; t++) survivors.push([a, b]);
+    }
+
+    const loops = traceLoops(survivors, pos2).map((ids3) => dropCollinear(ids3.map((id) => pos3[id] as Vec3)));
+    const outers = loops.filter((l) => signedArea2(l.map(project)) > 0);
+    const holes = loops.filter((l) => signedArea2(l.map(project)) < 0);
+
+    // Attach each fragment and hole to the outer loop that contains it; carry provenance as the min
+    // owning primId over the fragments landing in that loop.
+    for (const outer of outers) {
+      const outer2 = outer.map(project);
+      const inThis = (p: Vec3) => pointInLoop2(project(p), outer2);
+      const parts = group.filter((f) => inThis(centroid(f.poly))).map((f) => f.poly);
+      const primId = group.filter((f) => inThis(centroid(f.poly))).reduce((m, f) => Math.min(m, f.primId), Number.POSITIVE_INFINITY);
+      const myHoles = holes.filter((h) => h[0] && inThis(h[0]));
+      faces.push({
+        poly: outer,
+        holes: myHoles.length ? myHoles : undefined,
+        parts: parts.length ? parts : [outer],
+        normal: g0.normal,
+        primId: Number.isFinite(primId) ? primId : g0.primId,
+        planeId: g0.planeId,
+      });
+    }
+  }
+  return { faces };
+}
+
+/** Feature-edge line segments of a Brep as flat `[x,y,z, …]` endpoint pairs — the clean architectural
+ *  line-work. Call on a {@link mergeCoplanar}'d Brep: it walks each face's outer + hole loops (no fan
+ *  diagonals, no interior split-edges) and deduplicates the edge geometric planes share, so every real
+ *  edge appears exactly once. */
+export function brepEdges(brep: Brep, eps = 1e-6): Float32Array {
+  const seen = new Set<string>();
+  const out: number[] = [];
+  const key = (p: Vec3): string => `${Math.round(p[0] / eps)},${Math.round(p[1] / eps)},${Math.round(p[2] / eps)}`;
+  for (const face of brep.faces) {
+    for (const loop of [face.poly, ...(face.holes ?? [])]) {
+      for (let i = 0; i < loop.length; i++) {
+        const a = loop[i] as Vec3;
+        const b = loop[(i + 1) % loop.length] as Vec3;
+        const ka = key(a);
+        const kb = key(b);
+        const ek = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+        if (seen.has(ek)) continue;
+        seen.add(ek);
+        out.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+      }
+    }
+  }
+  return Float32Array.from(out);
 }

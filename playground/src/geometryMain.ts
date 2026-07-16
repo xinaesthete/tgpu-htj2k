@@ -7,7 +7,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { WebGPURenderer } from "three/webgpu";
-import { brepToMesh, evaluateBrep, type IsoMesh } from "../../src/geometry";
+import { brepEdges, brepToMesh, evaluateBrep, type IsoMesh, mergeCoplanar } from "../../src/geometry";
 import { SHAPES } from "./geometryShapes";
 
 const SPHERE_ORANGE = 0xff8a3c;
@@ -65,6 +65,11 @@ async function main(): Promise<void> {
   const wireMaterial = new THREE.MeshBasicMaterial({ color: 0xbfe0ff, wireframe: true });
   const mesh = new THREE.Mesh(new THREE.BufferGeometry(), material);
   scene.add(mesh);
+  // Feature edges (BSP only): the merged faces' outlines as clean line-work — no fan diagonals, no
+  // interior split-edges. Shown in place of triangle-wireframe when the exact mesher is active.
+  const edges = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xbfe0ff }));
+  edges.visible = false;
+  scene.add(edges);
 
   // ── UI ────────────────────────────────────────────────────────────────────────────────
   const shapeSel = document.getElementById("shape") as HTMLSelectElement;
@@ -80,6 +85,20 @@ async function main(): Promise<void> {
     o.textContent = s.name;
     shapeSel.appendChild(o);
   });
+
+  // Feature edges are only meaningful for the BSP; the grid falls back to triangle-wireframe.
+  let hasEdges = false;
+  function applyWire(): void {
+    const wire = wireBox.checked;
+    if (wire && hasEdges) {
+      mesh.visible = false;
+      edges.visible = true;
+    } else {
+      mesh.visible = true;
+      edges.visible = false;
+      mesh.material = wire ? wireMaterial : material;
+    }
+  }
 
   function rebuild(): void {
     const shape = SHAPES[Number(shapeSel.value)] ?? SHAPES[0];
@@ -97,36 +116,41 @@ async function main(): Promise<void> {
     const t0 = performance.now();
     if (bsp) {
       try {
-        iso = brepToMesh(evaluateBrep(shape.make().node, { bounds: shape.bounds }));
-        method = "plane BSP (exact)";
+        const brep = mergeCoplanar(evaluateBrep(shape.make().node, { bounds: shape.bounds }));
+        iso = brepToMesh(brep);
+        edges.geometry.dispose();
+        const eg = new THREE.BufferGeometry();
+        eg.setAttribute("position", new THREE.BufferAttribute(brepEdges(brep), 3));
+        edges.geometry = eg;
+        hasEdges = true;
+        method = `plane BSP (exact) · ${brep.faces.length} faces`;
       } catch (e) {
-        // Non-polyhedral (curved/smooth) or coincident-face shapes: fall back to the grid so the view
-        // isn't empty, and say why the exact mesher declined.
+        // Non-polyhedral (curved/smooth) shapes: fall back to the grid so the view isn't empty, and
+        // say why the exact mesher declined.
         iso = shape.make().toMesh({ bounds: shape.bounds, res, sharpen });
-        const ms = performance.now() - t0;
+        hasEdges = false;
         mesh.geometry.dispose();
         mesh.geometry = toBufferGeometry(iso);
-        mesh.material = wireBox.checked ? wireMaterial : material;
+        applyWire();
         stat.textContent = `BSP declined (${String(e).replace(/^Error:\s*bsp:\s*/, "")}) — showing surface nets · ${(iso.indices.length / 3).toLocaleString()} tris`;
         return;
       }
     } else {
       iso = shape.make().toMesh({ bounds: shape.bounds, res, sharpen });
+      hasEdges = false;
       method = sharpen ? "dual contouring" : "surface nets";
     }
     const ms = performance.now() - t0;
     mesh.geometry.dispose();
     mesh.geometry = toBufferGeometry(iso);
-    mesh.material = wireBox.checked ? wireMaterial : material;
+    applyWire();
     stat.textContent = `${iso.vertexCount.toLocaleString()} verts · ${(iso.indices.length / 3).toLocaleString()} tris · extracted in ${ms.toFixed(0)} ms (CPU ${method})`;
   }
   shapeSel.addEventListener("change", rebuild);
   mesherSel.addEventListener("change", rebuild);
   resInput.addEventListener("input", rebuild);
   sharpenBox.addEventListener("change", rebuild);
-  wireBox.addEventListener("change", () => {
-    mesh.material = wireBox.checked ? wireMaterial : material;
-  });
+  wireBox.addEventListener("change", applyWire);
   rebuild();
 
   function resize(): void {

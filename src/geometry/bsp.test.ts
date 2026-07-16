@@ -3,7 +3,7 @@
 // the raymarch consume the same `evalSdf`, these are the same red/green the render is judged by.
 
 import { describe, expect, it } from "vitest";
-import { type Brep, brepToMesh, evaluateBrep } from "./bsp";
+import { type Brep, brepEdges, brepToMesh, evaluateBrep, mergeCoplanar } from "./bsp";
 import { evalSdf, type Sdf } from "./implicit";
 import { box, plane, sphere } from "./index";
 import type { Vec3 } from "./superellipsoid";
@@ -37,16 +37,20 @@ function expectNoDuplicateTriangles(mesh: { positions: Float32Array; indices: Ui
   }
 }
 
-/** Every face lies on the surface (|SDF| ≈ 0) and its normal points outward (SDF grows along +n). */
+/** Every face lies on the surface (|SDF| ≈ 0) and its normal points outward (SDF grows along +n). A
+ *  merged face is validated through its convex `parts` — the outer-loop centroid of a holed face can
+ *  fall inside the hole, off the solid. */
 function expectValidBoundary(node: Sdf, brep: Brep): void {
   expect(brep.faces.length).toBeGreaterThan(0);
   for (const face of brep.faces) {
-    for (const p of facePoints(face.poly)) {
-      expect(Math.abs(evalSdf(node, p))).toBeLessThan(1e-5); // on the zero-set
+    for (const piece of face.parts ?? [face.poly]) {
+      for (const p of facePoints(piece)) {
+        expect(Math.abs(evalSdf(node, p))).toBeLessThan(1e-5); // on the zero-set
+      }
+      const c = centroid(piece);
+      expect(evalSdf(node, add(c, mul(face.normal, 1e-3)))).toBeGreaterThan(0); // just outside → outside
+      expect(evalSdf(node, sub(c, mul(face.normal, 1e-3)))).toBeLessThan(0); // just inside → inside
     }
-    const c = centroid(face.poly);
-    expect(evalSdf(node, add(c, mul(face.normal, 1e-3)))).toBeGreaterThan(0); // just outside → outside
-    expect(evalSdf(node, sub(c, mul(face.normal, 1e-3)))).toBeLessThan(0); // just inside → inside
   }
 }
 
@@ -147,6 +151,61 @@ describe("evaluateBrep — coincident faces", () => {
     const brep = evaluateBrep(l.node, { bounds: 2 });
     expectValidBoundary(l.node, brep);
     expectNoDuplicateTriangles(brepToMesh(brep));
+  });
+});
+
+describe("mergeCoplanar + brepEdges", () => {
+  it("leaves a box at six quads and twelve feature edges", () => {
+    const merged = mergeCoplanar(evaluateBrep(box(1).node, { bounds: 1.5 }));
+    expect(merged.faces).toHaveLength(6);
+    for (const f of merged.faces) expect(f.poly).toHaveLength(4);
+    expect(brepEdges(merged).length / 6).toBe(12); // a cube has 12 edges (6 floats per segment)
+    expectValidBoundary(box(1).node, merged);
+  });
+
+  it("fuses two abutting boxes into one box — six faces, twelve edges", () => {
+    const g = box(1).union(box(1).translate(2, 0, 0)); // merges to a single 4×2×2 box
+    const raw = evaluateBrep(g.node, { bounds: 3 });
+    const merged = mergeCoplanar(raw);
+    expect(merged.faces.length).toBeLessThan(raw.faces.length); // split tops/sides fused
+    expect(merged.faces).toHaveLength(6);
+    expect(brepEdges(merged).length / 6).toBe(12);
+    expectValidBoundary(g.node, merged);
+    expectNoDuplicateTriangles(brepToMesh(merged));
+  });
+
+  it("keeps a non-convex outline as one face (corner notch)", () => {
+    const g = box(1).subtract(box(0.5, 0.5, 2).translate(1, 1, 0)); // removes a corner edge, no hole
+    const merged = mergeCoplanar(evaluateBrep(g.node, { bounds: 2 }));
+    expect(merged.faces.some((f) => f.poly.length > 4)).toBe(true); // the L-shaped +x / +y faces
+    expect(merged.faces.every((f) => !f.holes)).toBe(true);
+    expectValidBoundary(g.node, merged);
+  });
+
+  it("recovers a hole when a tool pokes through a face", () => {
+    const g = box(1).subtract(box(0.4, 0.4, 0.4).translate(0.8, 0, 0)); // square hole in the +x face
+    const merged = mergeCoplanar(evaluateBrep(g.node, { bounds: 2 }));
+    const holed = merged.faces.filter((f) => f.holes?.length);
+    expect(holed).toHaveLength(1);
+    expect((holed[0] as { holes?: Vec3[][] }).holes).toHaveLength(1);
+    expectValidBoundary(g.node, merged); // parts still triangulate the frame correctly
+  });
+
+  it("merges the flush-arms L and yields clean line-work", () => {
+    const arm = (cx: number, cz: number, hx: number, hz: number) =>
+      box(hx, 1.5, hz)
+        .translate(cx, 0.75, cz)
+        .intersect(roofPlane([1, 1, 0], [cx + hx, 0.5, cz]))
+        .intersect(roofPlane([-1, 1, 0], [cx - hx, 0.5, cz]))
+        .intersect(roofPlane([0, 1, 1], [cx, 0.5, cz + hz]))
+        .intersect(roofPlane([0, 1, -1], [cx, 0.5, cz - hz]));
+    const l = arm(-0.3, 0, 0.7, 0.4).union(arm(0, 0.3, 0.4, 0.7));
+    const raw = evaluateBrep(l.node, { bounds: 2 });
+    const merged = mergeCoplanar(raw);
+    expect(merged.faces.length).toBeLessThanOrEqual(raw.faces.length);
+    expect(brepEdges(merged).length).toBeGreaterThan(0);
+    expectValidBoundary(l.node, merged);
+    expectNoDuplicateTriangles(brepToMesh(merged));
   });
 });
 
