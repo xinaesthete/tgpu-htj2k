@@ -17,12 +17,19 @@
 // half-space/box fields gives the exact inside/outside *sign*, so the mesh boundary is validated
 // against the same golden the raymarch renders — genuine red/green (see `bsp.test.ts`).
 //
-// Scope (first slice): generators `box`/`plane`; booleans `union`/`intersect`/`subtract`; domain
-// transforms `translate`/`scale` (uniform, positive). Curved/smooth ops (`sphere`/`smoothUnion`) are
-// rejected with a clear error — they route to grid-DC or raymarch. NOT yet handled: exactly coincident
-// faces from two primitives sharing a plane (shared walls, the L/T junctions). That needs the
-// coincident-face rule over a canonical-plane registry and is the next slice; `evaluateBrep` throws
-// rather than emit a doubled or dropped face silently.
+// Coincident faces (two primitives sharing a plane — shared walls, the L/T junctions) are handled by
+// evaluating each *canonical* geometric plane exactly ONCE rather than per-primitive: the plane's whole
+// boundary contribution is computed from one seed, so the doubling a per-primitive pass produces can't
+// arise. Opposite-oriented shared walls (a union's back-to-back faces) classify as interior and drop;
+// same-oriented duplicates (an intersection's shared cap) collapse to the single surviving face. The
+// exact SDF is still the in/out oracle: the ±ε classification offset crosses every coincident plane at
+// once, so it reports the true just-inside/just-outside of the whole stack.
+//
+// Scope: generators `box`/`plane`; booleans `union`/`intersect`/`subtract`; domain transforms
+// `translate`/`scale` (uniform, positive). Curved/smooth ops (`sphere`/`smoothUnion`) are rejected with
+// a clear error — they route to grid-DC or raymarch. NOT yet done (correctness unaffected): merging
+// coplanar-*adjacent* faces into one (a minimality pass — a plane split by a crossing plane yields two
+// abutting faces) and octree localisation (pure acceleration).
 
 import type { Expr } from "./expr";
 import { evalExpr } from "./expr";
@@ -212,67 +219,86 @@ export interface BrepOptions {
   bounds?: number;
 }
 
-/** Evaluate the exact polyhedral boundary of `node`. Each primitive face is seeded, clipped to its own
- *  primitive, split by every *other* primitive's planes so each fragment is uniformly in/out of the
- *  whole solid, then kept iff it separates inside from outside — the classic CSG boundary-by-
- *  classification, with the exact SDF (`evalSdf`) as the in/out oracle. */
+/** A canonical (deduplicated) geometric plane and the primitive faces lying on it. `n`/`d` fix one
+ *  orientation; each owner records the sign of *its* outward normal relative to that (`+1` same, `−1`
+ *  opposite) — how a union's back-to-back shared wall (opposite signs) is told from an intersection's
+ *  shared cap (same sign). */
+interface CanonPlane {
+  n: Vec3;
+  d: number;
+  owners: { primId: number; sign: number }[];
+}
+
+/** Merge the primitives' planes into canonical geometric planes (coincident planes collapsed), keeping
+ *  each owner and its orientation. */
+function canonicalPlanes(prims: Prim[], eps: number): CanonPlane[] {
+  const canon: CanonPlane[] = [];
+  for (const prim of prims)
+    for (const p of prim.planes) {
+      const hit = canon.find((c) => samePlane(c, p, eps));
+      if (hit) hit.owners.push({ primId: prim.primId, sign: dot(hit.n, p.n) >= 0 ? 1 : -1 });
+      else canon.push({ n: p.n, d: p.d, owners: [{ primId: prim.primId, sign: 1 }] });
+    }
+  return canon;
+}
+
+/** Attribute a boundary fragment to a source primitive (ADR-0012 provenance). Prefer an owner whose
+ *  outward normal agrees with the fragment's (`sign`) and whose solid actually contains the fragment
+ *  centroid; fall back to the lowest owning `primId`. */
+function pickOwner(canon: CanonPlane, sign: number, c: Vec3, prims: Prim[], tol: number): number {
+  const agree = canon.owners.filter((o) => o.sign === sign);
+  const pool = agree.length ? agree : canon.owners;
+  const byId = (a: { primId: number }, b: { primId: number }) => a.primId - b.primId;
+  const contains = (primId: number): boolean => {
+    const prim = prims.find((p) => p.primId === primId);
+    return !!prim && prim.planes.every((pl) => dot(c, pl.n) - pl.d <= tol);
+  };
+  const inside = pool.filter((o) => contains(o.primId));
+  return (inside.length ? inside : pool).sort(byId)[0]?.primId ?? 0;
+}
+
+/** Evaluate the exact polyhedral boundary of `node`. Each *canonical* geometric plane is seeded once,
+ *  split by every other canonical plane so each fragment is uniformly in/out of the whole solid, then
+ *  kept iff it separates inside from outside — CSG boundary-by-classification with the exact SDF
+ *  (`evalSdf`) as the in/out oracle. Visiting each plane once (not per-primitive) makes coincident faces
+ *  a non-event: the plane's whole contribution is computed in one place, so nothing is doubled. */
 export function evaluateBrep(node: Sdf, opts: BrepOptions = {}): Brep {
   const prims = lower(node);
   const half = (opts.bounds ?? 4) * 4; // seed quads well outside the solid; classification trims them
   const eps = 1e-7 * Math.max(half, 1);
   const nEps = 1e-4 * Math.max(opts.bounds ?? 4, 1); // classification offset off the face plane
-
-  // Reject exactly-coincident faces up front (next-slice work) rather than doubling/dropping silently.
-  const all: { owner: number; plane: Plane }[] = prims.flatMap((p) => p.planes.map((plane) => ({ owner: p.primId, plane })));
-  for (let i = 0; i < all.length; i++)
-    for (let j = i + 1; j < all.length; j++) {
-      const a = all[i] as { owner: number; plane: Plane };
-      const b = all[j] as { owner: number; plane: Plane };
-      if (a.owner !== b.owner && samePlane(a.plane, b.plane, eps))
-        throw new Error(
-          "bsp: two primitives share a coincident plane — coincident-face handling is the next slice; use grid-DC (toMesh) for now",
-        );
-    }
+  const canon = canonicalPlanes(prims, eps);
 
   const faces: BrepFace[] = [];
-  for (const prim of prims) {
-    prim.planes.forEach((plane, planeId) => {
-      // The primitive's own face on this plane: seed quad clipped by the primitive's other planes.
-      let face = seedQuad(plane, half);
-      for (const other of prim.planes) {
-        if (other === plane) continue;
-        face = clipHalf(face, other.n, other.d, eps);
+  canon.forEach((plane, planeId) => {
+    // Split the seed by every OTHER canonical plane so each fragment is uniformly inside/outside the
+    // whole solid (a plane never splits itself — canonicalisation already merged coincident planes).
+    let frags = [seedQuad(plane, half)];
+    for (const other of canon) {
+      if (other === plane) continue;
+      const next: Vec3[][] = [];
+      for (const f of frags) {
+        const { inside, outside } = split(f, other.n, other.d, eps);
+        if (inside.length >= 3) next.push(inside);
+        if (outside.length >= 3) next.push(outside);
       }
-      if (face.length < 3) return;
+      frags = next;
+    }
 
-      // Split by every other primitive's planes so each fragment is uniformly inside/outside the whole
-      // solid. Skip planes coincident with this face (a face can't be split by its own geometric plane).
-      let frags = [face];
-      for (const { owner, plane: sp } of all) {
-        if (owner === prim.primId) continue;
-        if (samePlane(sp, plane, eps)) continue;
-        const next: Vec3[][] = [];
-        for (const f of frags) {
-          const { inside, outside } = split(f, sp.n, sp.d, eps);
-          if (inside.length >= 3) next.push(inside);
-          if (outside.length >= 3) next.push(outside);
-        }
-        frags = next;
-      }
-
-      // Keep a fragment iff it separates inside from outside; orient its normal outward.
-      for (const f0 of frags) {
-        const f = dedupe(f0, eps);
-        if (f.length < 3) continue;
-        const c = centroid(f);
-        const insideSolid = evalSdf(node, sub(c, mul(plane.n, nEps))) < 0; // just inside this half-space
-        const outsideSolid = evalSdf(node, add(c, mul(plane.n, nEps))) < 0; // just outside it
-        if (insideSolid === outsideSolid) continue; // buried or floating — not on ∂S
-        if (insideSolid) faces.push({ poly: f, normal: plane.n, primId: prim.primId, planeId });
-        else faces.push({ poly: [...f].reverse(), normal: mul(plane.n, -1), primId: prim.primId, planeId });
-      }
-    });
-  }
+    // Keep a fragment iff it separates inside from outside; orient its normal outward.
+    for (const f0 of frags) {
+      const f = dedupe(f0, eps);
+      if (f.length < 3) continue;
+      const c = centroid(f);
+      const insideNeg = evalSdf(node, sub(c, mul(plane.n, nEps))) < 0; // solid just on the −n side?
+      const insidePos = evalSdf(node, add(c, mul(plane.n, nEps))) < 0; // solid just on the +n side?
+      if (insideNeg === insidePos) continue; // buried (both) or floating (neither) — not on ∂S
+      const sign = insideNeg ? 1 : -1; // outward is +n exactly when the solid is on the −n side
+      const normal = insideNeg ? plane.n : mul(plane.n, -1);
+      const poly = insideNeg ? f : [...f].reverse();
+      faces.push({ poly, normal, primId: pickOwner(plane, sign, c, prims, nEps), planeId });
+    }
+  });
   return { faces };
 }
 

@@ -23,6 +23,20 @@ function facePoints(poly: Vec3[]): Vec3[] {
   return [c, ...poly.map((v) => add(v, mul(sub(c, v), 0.15)))];
 }
 
+/** No two triangles are the same (same three vertices, any order) — catches doubled coincident faces. */
+function expectNoDuplicateTriangles(mesh: { positions: Float32Array; indices: Uint32Array }): void {
+  const key = (i: number): string => {
+    const p = mesh.positions;
+    return [p[i * 3], p[i * 3 + 1], p[i * 3 + 2]].map((x) => (x as number).toFixed(4)).join(",");
+  };
+  const seen = new Set<string>();
+  for (let t = 0; t < mesh.indices.length; t += 3) {
+    const tri = [key(mesh.indices[t] as number), key(mesh.indices[t + 1] as number), key(mesh.indices[t + 2] as number)].sort().join("|");
+    expect(seen.has(tri)).toBe(false);
+    seen.add(tri);
+  }
+}
+
 /** Every face lies on the surface (|SDF| ≈ 0) and its normal points outward (SDF grows along +n). */
 function expectValidBoundary(node: Sdf, brep: Brep): void {
   expect(brep.faces.length).toBeGreaterThan(0);
@@ -96,13 +110,48 @@ describe("evaluateBrep — plane-native boundary", () => {
   });
 });
 
+describe("evaluateBrep — coincident faces", () => {
+  it("unions two abutting boxes, dropping the interior shared wall", () => {
+    const shared = box(1).union(box(1).translate(2, 0, 0)); // both cap the plane x = 1, opposite normals
+    const brep = evaluateBrep(shared.node, { bounds: 3 });
+    expectValidBoundary(shared.node, brep);
+    // The shared wall is interior to the union → no face lies on x = 1.
+    const wallAt1 = brep.faces.filter((f) => f.poly.every((v) => Math.abs(v[0] - 1) < 1e-6));
+    expect(wallAt1).toHaveLength(0);
+    // The merged solid still spans x ∈ [−1, 3].
+    const xs = brep.faces.flatMap((f) => f.poly.map((v) => v[0]));
+    expect(Math.min(...xs)).toBeCloseTo(-1, 6);
+    expect(Math.max(...xs)).toBeCloseTo(3, 6);
+    expectNoDuplicateTriangles(brepToMesh(brep));
+  });
+
+  it("collapses same-oriented coincident caps to one face (A ∩ A = A)", () => {
+    const g = box(1).intersect(box(1)); // all six planes coincide with the same orientation
+    const brep = evaluateBrep(g.node, { bounds: 1.5 });
+    expect(brep.faces).toHaveLength(6); // one box, not a doubled shell
+    expectValidBoundary(g.node, brep);
+    expectNoDuplicateTriangles(brepToMesh(brep));
+  });
+
+  it("meshes an L of two roofed arms sharing a wall+roof plane, no doubling", () => {
+    // Two equal-height hip arms overlapping at the corner — the flush-arms L. Their inner walls and
+    // roof planes are exactly coincident (what plain union absorbs and this must not double).
+    const arm = (cx: number, cz: number, hx: number, hz: number) =>
+      box(hx, 1.5, hz)
+        .translate(cx, 0.75, cz)
+        .intersect(roofPlane([1, 1, 0], [cx + hx, 0.5, cz]))
+        .intersect(roofPlane([-1, 1, 0], [cx - hx, 0.5, cz]))
+        .intersect(roofPlane([0, 1, 1], [cx, 0.5, cz + hz]))
+        .intersect(roofPlane([0, 1, -1], [cx, 0.5, cz - hz]));
+    const l = arm(-0.3, 0, 0.7, 0.4).union(arm(0, 0.3, 0.4, 0.7));
+    const brep = evaluateBrep(l.node, { bounds: 2 });
+    expectValidBoundary(l.node, brep);
+    expectNoDuplicateTriangles(brepToMesh(brep));
+  });
+});
+
 describe("evaluateBrep — scope guards", () => {
   it("rejects a non-polyhedral op with a routing hint", () => {
     expect(() => evaluateBrep(box(1).subtract(sphere(0.5)).node)).toThrow(/non-polyhedral/);
-  });
-
-  it("rejects exactly-coincident faces (shared-wall case) — the next slice", () => {
-    const shared = box(1).union(box(1).translate(2, 0, 0)); // both share the plane x = 1
-    expect(() => evaluateBrep(shared.node, { bounds: 3 })).toThrow(/coincident/);
   });
 });
