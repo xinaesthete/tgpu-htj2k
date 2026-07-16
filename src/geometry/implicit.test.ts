@@ -37,6 +37,41 @@ describe("Implicit: analytic distances", () => {
   });
 });
 
+describe("Implicit: displace (value-noise)", () => {
+  const pts: Vec3[] = [
+    [0.3, 0.1, -0.2],
+    [-0.7, 0.4, 0.6],
+    [1.1, -0.9, 0.2],
+    [0, 0, 0],
+    [-0.35, -0.15, 0.85],
+  ];
+  const MAX_FBM = 0.9375; // 0.5 + 0.25 + 0.125 + 0.0625 — value noise ∈ [−1,1], 4 octaves
+
+  it("adds bounded fbm noise to the child field", () => {
+    const base = sphere(1);
+    const g = base.displace(0.3, 2);
+    for (const p of pts) expect(Math.abs(g.eval(p) - base.eval(p))).toBeLessThanOrEqual(0.3 * MAX_FBM + 1e-6);
+  });
+
+  it("is a no-op at amp 0 and deterministic otherwise", () => {
+    const base = box(0.8);
+    expect(base.displace(0, 3).eval([0.3, 0.1, -0.2])).toBeCloseTo(base.eval([0.3, 0.1, -0.2]), 12);
+    const g = base.displace(0.2, 3);
+    expect(g.eval([0.3, 0.1, -0.2])).toBe(g.eval([0.3, 0.1, -0.2])); // pure function of position
+  });
+
+  it("actually perturbs the surface (noise is not flat)", () => {
+    const base = sphere(1);
+    const g = base.displace(0.4, 2.5);
+    expect(Math.max(...pts.map((p) => Math.abs(g.eval(p) - base.eval(p))))).toBeGreaterThan(0.01);
+  });
+
+  it("exposes its params after the child, in canonical order", () => {
+    const g = sphere(constant(1)).displace(constant(0.25), constant(2)); // f32-exact values
+    expect(Array.from(g.paramVector())).toEqual([1, 0.25, 2]);
+  });
+});
+
 describe("Implicit: boolean semantics", () => {
   const a = sphere(1).translate(-0.5, 0, 0);
   const b = sphere(1).translate(0.5, 0, 0);

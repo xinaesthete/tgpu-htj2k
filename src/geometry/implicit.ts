@@ -31,7 +31,17 @@
 // give each primitive a stable address for it.
 
 import type { ParamSpec } from "../gpu/graph/op";
-import { collectConsts, collectSpecs, type Expr, type ExprLike, evalExpr, toExpr, type UniformCtx, wgslExpr, wgslExprUniform } from "./expr";
+import {
+  collectConsts,
+  collectSpecs,
+  type Expr,
+  type ExprLike,
+  evalExpr,
+  toExpr,
+  type UniformCtx,
+  wgslExpr,
+  wgslExprUniform,
+} from "./expr";
 import type { Vec3 } from "./superellipsoid";
 
 // ── The SDF IR ────────────────────────────────────────────────────────────────────────
@@ -52,7 +62,11 @@ export type Sdf =
   | { kind: "subtract"; a: Sdf; b: Sdf }
   | { kind: "smoothUnion"; a: Sdf; b: Sdf; k: Expr }
   | { kind: "translate"; t: [Expr, Expr, Expr]; child: Sdf }
-  | { kind: "scale"; factor: Expr; child: Sdf };
+  | { kind: "scale"; factor: Expr; child: Sdf }
+  /** Add `amp · fbm(freq · p)` to a child field — a value-noise displacement that makes an organic,
+   *  lumpy surface. Breaks the exact distance property (the raymarch under-relaxes for it), so it is a
+   *  *display* op: the raymarch animates it via a time drift; the grid mesher can still tessellate it. */
+  | { kind: "displace"; child: Sdf; amp: Expr; freq: Expr };
 
 /** Visit every scalar `Expr` param of the tree in the **canonical pre-order** — own params before
  *  children, in field order. `paramVector`, `specs`, and `wgslSdf` all traverse in this exact order,
@@ -95,6 +109,11 @@ function eachParam(node: Sdf, visit: (e: Expr) => void): void {
       visit(node.factor);
       eachParam(node.child, visit);
       break;
+    case "displace":
+      eachParam(node.child, visit);
+      visit(node.amp);
+      visit(node.freq);
+      break;
   }
 }
 
@@ -119,6 +138,58 @@ function sdBox(p: Vec3, b: Vec3): number {
 function smin(a: number, b: number, k: number): number {
   const h = Math.max(k - Math.abs(a - b), 0) / k;
   return Math.min(a, b) - h * h * k * 0.25;
+}
+
+// ── value noise (the `displace` op) ─────────────────────────────────────────────────────
+// A hash-lattice value noise + 4-octave fbm. The hash is pure u32 integer arithmetic (emulated with
+// `Math.imul`/`>>>0`), *identical* to the WGSL in `SDF_PREAMBLE`, so the only CPU/GPU divergence is
+// the final f32-vs-f64 interpolation — small enough for the parity test's tolerance.
+
+/** iq's integer hash, u32 → u32 (bit-exact with the WGSL `hashU`). */
+function hashU(n: number): number {
+  let m = (n ^ (n << 13)) >>> 0;
+  const sq = Math.imul(m, m) >>> 0;
+  m = (Math.imul(m, (Math.imul(sq, 15731) + 789221) >>> 0) + 1376312589) >>> 0;
+  return m >>> 0;
+}
+/** Value at an integer lattice corner, in `[0, 1]`. */
+function hashLattice(ix: number, iy: number, iz: number): number {
+  const n = (Math.imul(ix, 1619) + Math.imul(iy, 31337) + Math.imul(iz, 6971)) >>> 0;
+  return (hashU(n) & 0x7fffffff) / 0x7fffffff;
+}
+const quintic = (t: number): number => t * t * t * (t * (t * 6 - 15) + 10);
+const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+
+/** Trilinearly-interpolated, quintic-smoothed value noise in `[-1, 1]`. */
+function valueNoise(px: number, py: number, pz: number): number {
+  const ix = Math.floor(px);
+  const iy = Math.floor(py);
+  const iz = Math.floor(pz);
+  const ux = quintic(px - ix);
+  const uy = quintic(py - iy);
+  const uz = quintic(pz - iz);
+  const x00 = lerp(hashLattice(ix, iy, iz), hashLattice(ix + 1, iy, iz), ux);
+  const x10 = lerp(hashLattice(ix, iy + 1, iz), hashLattice(ix + 1, iy + 1, iz), ux);
+  const x01 = lerp(hashLattice(ix, iy, iz + 1), hashLattice(ix + 1, iy, iz + 1), ux);
+  const x11 = lerp(hashLattice(ix, iy + 1, iz + 1), hashLattice(ix + 1, iy + 1, iz + 1), ux);
+  return lerp(lerp(x00, x10, uy), lerp(x01, x11, uy), uz) * 2 - 1;
+}
+
+/** Four-octave fractal Brownian motion of {@link valueNoise}. */
+function fbm3(px: number, py: number, pz: number): number {
+  let s = 0;
+  let a = 0.5;
+  let qx = px;
+  let qy = py;
+  let qz = pz;
+  for (let o = 0; o < 4; o++) {
+    s += a * valueNoise(qx, qy, qz);
+    qx *= 2;
+    qy *= 2;
+    qz *= 2;
+    a *= 0.5;
+  }
+  return s;
 }
 
 /** Signed distance from `p` to the surface described by `node` — the golden reference. Negative
@@ -149,6 +220,10 @@ export function evalSdf(node: Sdf, p: Vec3): number {
     case "scale": {
       const f = val(node.factor);
       return evalSdf(node.child, [p[0] / f, p[1] / f, p[2] / f]) * f;
+    }
+    case "displace": {
+      const freq = val(node.freq);
+      return evalSdf(node.child, p) + val(node.amp) * fbm3(p[0] * freq, p[1] * freq, p[2] * freq);
     }
   }
 }
@@ -216,6 +291,15 @@ export function wgslSdf(node: Sdf, pt: string, emit: (e: Expr) => string): strin
       const f = emit(node.factor);
       return `(${wgslSdf(node.child, `(${pt} / ${f})`, emit)} * ${f})`;
     }
+    case "displace": {
+      // Child first (emits its params), then amp, then freq — matching eachParam. The noise domain
+      // carries `uNoiseTime` (a private global the raymarch sets per frame; 0 for the static golden),
+      // so the lumps drift over time without disturbing the base shape.
+      const child = wgslSdf(node.child, pt, emit);
+      const amp = emit(node.amp);
+      const freq = emit(node.freq);
+      return `(${child} + ${amp} * fbm3((${pt}) * ${freq} + vec3<f32>(0.0, uNoiseTime, uNoiseTime * 0.5)))`;
+    }
   }
 }
 
@@ -228,6 +312,40 @@ fn sdBox(p: vec3<f32>, b: vec3<f32>) -> f32 {
 fn smin(a: f32, b: f32, k: f32) -> f32 {
   let h = max(k - abs(a - b), 0.0) / k;
   return min(a, b) - h * h * k * 0.25;
+}
+// Value noise for the displace op — bit-exact hash with the CPU golden (u32 integer arithmetic).
+// A render pass sets uNoiseTime per frame to drift the noise domain (animation); it defaults to 0, so
+// the static field the CPU golden and parity harness see is at uNoiseTime = 0.
+var<private> uNoiseTime: f32 = 0.0;
+fn hashU(n0: u32) -> u32 {
+  let n = (n0 << 13u) ^ n0;
+  return n * (n * n * 15731u + 789221u) + 1376312589u;
+}
+fn hashLattice(c: vec3<i32>) -> f32 {
+  let n = u32(c.x) * 1619u + u32(c.y) * 31337u + u32(c.z) * 6971u;
+  return f32(hashU(n) & 0x7fffffffu) / f32(0x7fffffff);
+}
+fn quintic3(t: vec3<f32>) -> vec3<f32> { return t * t * t * (t * (t * 6.0 - 15.0) + 10.0); }
+fn valueNoise(p: vec3<f32>) -> f32 {
+  let i = floor(p);
+  let ci = vec3<i32>(i);
+  let u = quintic3(p - i);
+  let x00 = mix(hashLattice(ci + vec3<i32>(0, 0, 0)), hashLattice(ci + vec3<i32>(1, 0, 0)), u.x);
+  let x10 = mix(hashLattice(ci + vec3<i32>(0, 1, 0)), hashLattice(ci + vec3<i32>(1, 1, 0)), u.x);
+  let x01 = mix(hashLattice(ci + vec3<i32>(0, 0, 1)), hashLattice(ci + vec3<i32>(1, 0, 1)), u.x);
+  let x11 = mix(hashLattice(ci + vec3<i32>(0, 1, 1)), hashLattice(ci + vec3<i32>(1, 1, 1)), u.x);
+  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z) * 2.0 - 1.0;
+}
+fn fbm3(p0: vec3<f32>) -> f32 {
+  var s = 0.0;
+  var a = 0.5;
+  var q = p0;
+  for (var o = 0; o < 4; o = o + 1) {
+    s = s + a * valueNoise(q);
+    q = q * 2.0;
+    a = a * 0.5;
+  }
+  return s;
 }
 `;
 
@@ -537,6 +655,12 @@ export class Implicit {
   /** Uniformly scale the field by `factor` (exact: distances scale with it). */
   scale(factor: ExprLike): Implicit {
     return new Implicit({ kind: "scale", factor: toExpr(factor), child: this.node });
+  }
+
+  /** Add `amp · fbm(freq · p)` noise to the field — a lumpy, organic displacement. A *display* op
+   *  (breaks the exact distance property); the raymarch under-relaxes and animates it. */
+  displace(amp: ExprLike, freq: ExprLike): Implicit {
+    return new Implicit({ kind: "displace", child: this.node, amp: toExpr(amp), freq: toExpr(freq) });
   }
 
   /** The breeding surface: every `ParamSpec` gene carried by this tree's param literals, in

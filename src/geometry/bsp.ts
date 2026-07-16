@@ -180,6 +180,7 @@ function lower(node: Sdf, scene: AABB): { prims: Prim[]; massAabb: Map<number, A
         break;
       case "sphere":
       case "smoothUnion":
+      case "displace":
         throw new Error(`bsp: non-polyhedral op '${n.kind}' — route curved/smooth geometry to grid-DC (toMesh) or raymarch`);
     }
   };

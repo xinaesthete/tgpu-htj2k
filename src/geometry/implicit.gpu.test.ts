@@ -5,6 +5,7 @@
 // segfaults past enough cumulative GPU work (ADR-0002/0003).
 import { describe, expect, it } from "vitest";
 import { nodeBackend } from "../gpu/graph/backend.node";
+import type { Implicit } from "./implicit";
 import { box, evalSdf, sphere } from "./implicit";
 import { sampleSdfGpu } from "./implicitGpu";
 import type { Vec3 } from "./superellipsoid";
@@ -43,5 +44,16 @@ describe("Implicit geometry: GPU sdScene matches the CPU golden", () => {
 
     expect(gpu.length).toBe(pts.length / 3);
     expect(maxAbsDiff(pts, gpu, g.node)).toBeLessThan(1e-4);
+  });
+
+  it("reproduces a noise-displaced field (bit-exact hash; f32/f64 interp only)", async () => {
+    // The value-noise hash is pure u32 arithmetic, identical CPU/GPU, so the only divergence is the
+    // f32-vs-f64 interpolation of four octaves — a looser but still tight bound than analytic fields.
+    const g: Implicit = sphere(1).displace(0.35, 2.5);
+    const pts = gridPoints(6, 1.4);
+    const device = await nodeBackend.getDevice();
+    const root = await nodeBackend.getRoot();
+    const gpu = await sampleSdfGpu(device, root, g, pts);
+    expect(maxAbsDiff(pts, gpu, g.node)).toBeLessThan(1e-3);
   });
 });
