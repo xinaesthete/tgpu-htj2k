@@ -33,16 +33,7 @@ import {
   wgslFn,
 } from "three/tsl";
 import { MeshBasicNodeMaterial, WebGPURenderer } from "three/webgpu";
-import {
-  type AABB,
-  aabbFinite,
-  brepToMesh,
-  evaluateBrep,
-  type Implicit,
-  mergeCoplanar,
-  nonPlanarRegions,
-  planarSkeleton,
-} from "../../src/geometry";
+import { type AABB, aabbFinite, brepToMesh, evaluateBrep, type Implicit, mergeCoplanar, nonPlanarRegions, planarSkeleton } from "../../src/geometry";
 import { hybridGrowth, hybridHouse } from "./geometryShapes";
 
 const RayResult = struct({ color: "vec4", depth: "float" });
@@ -143,9 +134,8 @@ ${model.toWgsl({ bakeConstants: true })}
   return mat;
 }
 
-/** Build a BufferGeometry from a plane-BSP mesh of a planar Sdf. */
-function meshOf(node: Parameters<typeof evaluateBrep>[0]): THREE.BufferGeometry {
-  const iso = brepToMesh(mergeCoplanar(evaluateBrep(node, { bounds: BOUNDS })));
+/** A BufferGeometry from a plane-BSP triangle mesh. */
+function toBufferGeometry(iso: ReturnType<typeof brepToMesh>): THREE.BufferGeometry {
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(iso.positions, 3));
   g.setAttribute("normal", new THREE.BufferAttribute(iso.normals, 3));
@@ -212,14 +202,25 @@ async function main(): Promise<void> {
     fail("Model has no planar skeleton to mesh.");
     return;
   }
+  const brep = mergeCoplanar(evaluateBrep(skel, { bounds: BOUNDS }));
+
   // Same node shading as the raymarch (via the geometry normal), so mesh and raymarch are one material.
   const houseMat = new MeshBasicNodeMaterial();
   houseMat.colorNode = shade(normalWorld);
-  houseMat.polygonOffset = true; // let the region raymarch win the depth test where they overlap
+  houseMat.polygonOffset = true; // let the region raymarch (and the wire) win the depth test where they overlap
   houseMat.polygonOffsetFactor = 1;
   houseMat.polygonOffsetUnits = 1;
-  const house = new THREE.Mesh(meshOf(skel), houseMat);
+  const houseGeom = toBufferGeometry(brepToMesh(brep));
+  const house = new THREE.Mesh(houseGeom, houseMat);
   scene.add(house);
+
+  // Raw-triangulation wireframe overlay (every triangle, fan diagonals and all — the technical-artist
+  // view of the actual mesh, not just clean feature edges). Depth-tested, so the raymarched growth
+  // occludes the triangles behind it — you can read where the mesh hands off to the raymarch; the
+  // house's polygon offset keeps the lines above its own faces.
+  const wire = new THREE.LineSegments(new THREE.WireframeGeometry(houseGeom), new THREE.LineBasicMaterial({ color: 0x18324e }));
+  wire.visible = false;
+  scene.add(wire);
 
   // One raymarch proxy per non-planar region — sized to the region box; its fragments march the model.
   const regions = nonPlanarRegions(model.node);
@@ -243,9 +244,13 @@ async function main(): Promise<void> {
 
   // ── UI ────────────────────────────────────────────────────────────────────────────────
   const houseBox = document.getElementById("house") as HTMLInputElement;
+  const wireBox = document.getElementById("wire") as HTMLInputElement;
   const regionBox = document.getElementById("region") as HTMLInputElement;
   houseBox.addEventListener("change", () => {
     house.visible = houseBox.checked;
+  });
+  wireBox.addEventListener("change", () => {
+    wire.visible = wireBox.checked;
   });
   regionBox.addEventListener("change", () => {
     for (const h of helpers) h.visible = regionBox.checked;
