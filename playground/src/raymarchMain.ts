@@ -23,6 +23,7 @@ import {
   min,
   mix,
   normalize,
+  normalWorld,
   positionWorld,
   struct,
   uniform,
@@ -48,6 +49,19 @@ const RayResult = struct({ color: "vec4", depth: "float" });
 const BOUNDS = 1.8;
 // The raymarch drives the noise animation; `uNoiseTime` in the codegen'd field reads this each frame.
 const uTime = uniform(0);
+
+// One shading node, used for BOTH the meshed house and the raymarched growth, so they render
+// identically (same albedo, same key-light + hemisphere, same node-material output path — no
+// PBR-vs-approximation or tone-mapping mismatch). Our lights are directional, so shading needs only the
+// surface normal; the mesh feeds its geometry normal, the raymarch feeds its gradient normal.
+const HOUSE_COLOR = vec3(0.78, 0.7, 0.6); // ≈ 0xc7b299
+function shade(n: ReturnType<typeof vec3>): ReturnType<typeof vec3> {
+  const lig = normalize(vec3(3, 5, 2)); // matches the scene key-light direction
+  const dif = clamp(dot(n, lig), 0, 1).mul(1.05);
+  const hemi = clamp(n.y.mul(0.5).add(0.5), 0, 1);
+  const amb = mix(vec3(0.14, 0.11, 0.08), vec3(0.5, 0.56, 0.72), hemi).mul(0.55);
+  return HOUSE_COLOR.mul(dif.add(amb));
+}
 
 /** A raymarch material for one non-planar region: sphere-traces the FULL model, but only within `box`
  *  (a ray-box slab bounds the march), and shades to match the meshed house so the two read as one
@@ -116,14 +130,8 @@ ${model.toWgsl({ bakeConstants: true })}
         .add(k3.mul(sdField({ p: pHit.add(k3.mul(e)), t: uTime }))),
     );
 
-    // Shade to approximate the house's PBR (key light + hemisphere), so the raymarched growth reads as
-    // the same material as the meshed house it grows out of.
-    const base = vec3(0.78, 0.7, 0.6); // ≈ 0xc7b299
-    const lig = normalize(vec3(3, 5, 2)); // matches the scene key light direction
-    const dif = clamp(dot(n, lig), 0, 1).mul(1.15);
-    const hemi = clamp(n.y.mul(0.5).add(0.5), 0, 1);
-    const amb = mix(vec3(0.12, 0.09, 0.06), vec3(0.62, 0.7, 1.0), hemi).mul(0.5);
-    const col = base.mul(dif.add(amb));
+    // The SAME shade node the meshed house uses — so the growth is the same material, seamlessly.
+    const col = shade(n);
 
     const hitViewZ = cameraViewMatrix.mul(vec4(pHit, 1)).z;
     const depth = viewZToPerspectiveDepth(hitViewZ, cameraNear, cameraFar);
@@ -204,8 +212,10 @@ async function main(): Promise<void> {
     fail("Model has no planar skeleton to mesh.");
     return;
   }
-  const houseMat = new THREE.MeshStandardMaterial({ color: 0xc7b299, roughness: 0.85, metalness: 0.0 });
-  houseMat.polygonOffset = true;
+  // Same node shading as the raymarch (via the geometry normal), so mesh and raymarch are one material.
+  const houseMat = new MeshBasicNodeMaterial();
+  houseMat.colorNode = shade(normalWorld);
+  houseMat.polygonOffset = true; // let the region raymarch win the depth test where they overlap
   houseMat.polygonOffsetFactor = 1;
   houseMat.polygonOffsetUnits = 1;
   const house = new THREE.Mesh(meshOf(skel), houseMat);
