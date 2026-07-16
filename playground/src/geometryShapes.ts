@@ -73,6 +73,20 @@ export const SHAPES: Shape[] = [
       return armA.union(armB);
     },
   },
+  // A grid of hip-roofed houses — 16 separate masses, so the BSP takes its octree-localised path
+  // (distant houses never split/classify against each other). Meshes to 16×9 clean faces.
+  {
+    name: "Village (4×4 houses)",
+    bounds: 3.2,
+    make: () => {
+      const n = 4;
+      const spacing = 1.4;
+      const at = (k: number) => (k - (n - 1) / 2) * spacing;
+      let g = roofedBox(at(0), at(0), 0.42, 0.42, 0.35, 1.0);
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) if (i || j) g = g.union(roofedBox(at(i), at(j), 0.42, 0.42, 0.35, 1.0));
+      return g;
+    },
+  },
   { name: "Cube ∖ sphere (bite)", bounds: 1.5, make: () => box(1).subtract(sphere(1.22)) },
   { name: "Sphere ∩ cube (lens-box)", bounds: 1.2, make: () => sphere(1.1).intersect(box(0.85)) },
   {

@@ -209,6 +209,68 @@ describe("mergeCoplanar + brepEdges", () => {
   });
 });
 
+describe("evaluateBrep — octree localisation", () => {
+  // A small hip-roofed house centred at (cx, cz); each is one mass (box ∩ four roof planes).
+  const house = (cx: number, cz: number) =>
+    box(0.4, 0.6, 0.4)
+      .translate(cx, 0.6, cz)
+      .intersect(roofPlane([1, 1, 0], [cx + 0.4, 0.2, cz]))
+      .intersect(roofPlane([-1, 1, 0], [cx - 0.4, 0.2, cz]))
+      .intersect(roofPlane([0, 1, 1], [cx, 0.2, cz + 0.4]))
+      .intersect(roofPlane([0, 1, -1], [cx, 0.2, cz - 0.4]));
+  const village = (n: number, spacing: number) => {
+    let g = house((0 - (n - 1) / 2) * spacing, (0 - (n - 1) / 2) * spacing);
+    let first = true;
+    for (let i = 0; i < n; i++)
+      for (let j = 0; j < n; j++) {
+        if (first) {
+          first = false;
+          continue;
+        }
+        g = g.union(house((i - (n - 1) / 2) * spacing, (j - (n - 1) / 2) * spacing));
+      }
+    return g;
+  };
+
+  /** Order-independent geometric signature of a Brep's faces (ignoring provenance/ordering). */
+  const faceKeys = (brep: Brep): string[] => {
+    const r = (x: number) => Math.round(x / 1e-4);
+    return brep.faces
+      .map((f) => {
+        const verts = f.poly
+          .map((v) => `${r(v[0])},${r(v[1])},${r(v[2])}`)
+          .sort()
+          .join(";");
+        return `${r(f.normal[0])},${r(f.normal[1])},${r(f.normal[2])}|${verts}`;
+      })
+      .sort();
+  };
+
+  it("gives the identical result whether localised or global", () => {
+    const g = village(2, 1.6); // four masses, well separated
+    const global = mergeCoplanar(evaluateBrep(g.node, { bounds: 4, octreeMaxMasses: 999 }));
+    const octree = mergeCoplanar(evaluateBrep(g.node, { bounds: 4, octreeMaxMasses: 1 })); // force subdivision
+    expect(faceKeys(octree)).toEqual(faceKeys(global));
+  });
+
+  it("meshes a 3×3 village validly through the octree", () => {
+    const g = village(3, 1.6);
+    const merged = mergeCoplanar(evaluateBrep(g.node, { bounds: 5, octreeMaxMasses: 2 }));
+    expectValidBoundary(g.node, merged);
+    expectNoDuplicateTriangles(brepToMesh(merged));
+    expect(merged.faces.length).toBe(9 * 9); // nine separate houses, nine faces each (4 roof + 4 wall + floor)
+  });
+
+  it("stays on the global pass below the mass threshold", () => {
+    // Two arms (the L) is two masses — with the default threshold it takes the simple global pass and
+    // still matches the forced-octree result.
+    const g = box(1).union(box(1).translate(2.5, 0, 0));
+    const dflt = mergeCoplanar(evaluateBrep(g.node, { bounds: 4 }));
+    const forced = mergeCoplanar(evaluateBrep(g.node, { bounds: 4, octreeMaxMasses: 1 }));
+    expect(faceKeys(dflt)).toEqual(faceKeys(forced));
+  });
+});
+
 describe("evaluateBrep — scope guards", () => {
   it("rejects a non-polyhedral op with a routing hint", () => {
     expect(() => evaluateBrep(box(1).subtract(sphere(0.5)).node)).toThrow(/non-polyhedral/);

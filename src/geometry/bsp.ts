@@ -29,10 +29,15 @@
 // loop + holes), which halves face counts and — via `brepEdges` — yields clean architectural line-work
 // (no fan diagonals, no interior split-edges).
 //
+// `evaluateBrep` localises through a space octree once a scene has more than `octreeMaxMasses` union
+// operands (masses): a face is split/classified only against the masses of the octree leaf it falls in,
+// so distant houses never interact and the work drops from O(masses²) toward O(masses). Classification
+// stays the exact *global* SDF, so the localised result is identical to the global pass (differentially
+// tested) — `mergeCoplanar` stitches the per-leaf fragments back into whole faces.
+//
 // Scope: generators `box`/`plane`; booleans `union`/`intersect`/`subtract`; domain transforms
 // `translate`/`scale` (uniform, positive). Curved/smooth ops (`sphere`/`smoothUnion`) are rejected with
-// a clear error — they route to grid-DC or raymarch. NOT yet done (correctness unaffected): octree
-// localisation (pure acceleration — the current split is O(planes²), instant at architectural scale).
+// a clear error — they route to grid-DC or raymarch.
 
 import type { Expr } from "./expr";
 import { evalExpr } from "./expr";
@@ -63,10 +68,40 @@ interface Plane {
 }
 
 /** A polyhedral leaf: the intersection of its half-spaces, tagged with the primitive's provenance
- *  address (`primId` = pre-order index of the leaf in the tree). */
+ *  address (`primId` = pre-order index of the leaf in the tree) and the `massId` of the bounded region
+ *  (union operand) it belongs to — the unit the octree localises by. */
 interface Prim {
   primId: number;
+  massId: number;
   planes: Plane[];
+}
+
+/** An axis-aligned bounding box. */
+interface AABB {
+  min: Vec3;
+  max: Vec3;
+}
+const aabbOverlap = (a: AABB, b: AABB, m = 0): boolean =>
+  a.min[0] - m <= b.max[0] &&
+  b.min[0] - m <= a.max[0] &&
+  a.min[1] - m <= b.max[1] &&
+  b.min[1] - m <= a.max[1] &&
+  a.min[2] - m <= b.max[2] &&
+  b.min[2] - m <= a.max[2];
+const aabbIntersect = (a: AABB, b: AABB): AABB => ({
+  min: [Math.max(a.min[0], b.min[0]), Math.max(a.min[1], b.min[1]), Math.max(a.min[2], b.min[2])],
+  max: [Math.min(a.max[0], b.max[0]), Math.min(a.max[1], b.max[1]), Math.min(a.max[2], b.max[2])],
+});
+/** Split a box into its eight octants. */
+function octants(b: AABB): AABB[] {
+  const c: Vec3 = [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, (b.min[2] + b.max[2]) / 2];
+  const out: AABB[] = [];
+  for (let i = 0; i < 8; i++) {
+    const lo: Vec3 = [i & 1 ? c[0] : b.min[0], i & 2 ? c[1] : b.min[1], i & 4 ? c[2] : b.min[2]];
+    const hi: Vec3 = [i & 1 ? b.max[0] : c[0], i & 2 ? b.max[1] : c[1], i & 4 ? b.max[2] : c[2]];
+    out.push({ min: lo, max: hi });
+  }
+  return out;
 }
 
 /** A cumulative uniform similarity from leaf coords to world: `world = S·leaf + O`. Descending the
@@ -83,12 +118,18 @@ function planeToWorld(n: Vec3, d: number, x: Xform): Plane {
   return { n, d: d * x.s + dot(x.o, n) };
 }
 
-/** Flatten the tree into world-space polyhedral leaves, assigning each a pre-order `primId`. Throws on
- *  a non-polyhedral op (sphere/smoothUnion) — those don't have planar faces and must route elsewhere. */
-function lower(node: Sdf): Prim[] {
+/** Flatten the tree into world-space polyhedral leaves. Each prim gets a pre-order `primId` and a
+ *  `massId` — the id of the bounded region it belongs to, where a `union` starts a fresh region on each
+ *  side (so distant houses are distinct masses) and `intersect`/`subtract` keep the region. Also
+ *  returns each mass's AABB: the intersection of its *additive* (non-subtracted) box AABBs, clamped to
+ *  the scene bounds — a conservative superset of the mass's true extent, which is all the octree needs.
+ *  Throws on a non-polyhedral op (sphere/smoothUnion): those have no planar faces and route elsewhere. */
+function lower(node: Sdf, scene: AABB): { prims: Prim[]; massAabb: Map<number, AABB> } {
   const prims: Prim[] = [];
+  const addBoxes = new Map<number, AABB[]>(); // massId → additive box AABBs
   let nextId = 0;
-  const walk = (n: Sdf, x: Xform): void => {
+  let nextMass = 0;
+  const walk = (n: Sdf, x: Xform, massId: number, tool: boolean): void => {
     switch (n.kind) {
       case "box": {
         const h: Vec3 = [val(n.half[0]), val(n.half[1]), val(n.half[2])];
@@ -101,34 +142,58 @@ function lower(node: Sdf): Prim[] {
           [0, 0, -1],
         ];
         const planes = axes.map((ax) => planeToWorld(ax, ax[0] !== 0 ? h[0] : ax[1] !== 0 ? h[1] : h[2], x));
-        prims.push({ primId: nextId++, planes });
+        prims.push({ primId: nextId++, massId, planes });
+        // A box's world AABB: centre = O, half = S·h (normals unaffected). Subtracted tools only shrink
+        // the mass, so they don't enter its bounding intersection.
+        if (!tool) {
+          const half: Vec3 = [x.s * h[0], x.s * h[1], x.s * h[2]];
+          const aabb: AABB = { min: sub(x.o, half), max: add(x.o, half) };
+          const list = addBoxes.get(massId);
+          if (list) list.push(aabb);
+          else addBoxes.set(massId, [aabb]);
+        }
         break;
       }
       case "plane": {
         const raw: Vec3 = [val(n.n[0]), val(n.n[1]), val(n.n[2])];
         const nn = norm(raw); // the primitive normalises on evaluation; match it here
-        prims.push({ primId: nextId++, planes: [planeToWorld(nn, val(n.d), x)] });
+        prims.push({ primId: nextId++, massId, planes: [planeToWorld(nn, val(n.d), x)] });
         break;
       }
       case "union":
+        walk(n.a, x, nextMass++, tool);
+        walk(n.b, x, nextMass++, tool);
+        break;
       case "intersect":
+        walk(n.a, x, massId, tool);
+        walk(n.b, x, massId, tool);
+        break;
       case "subtract":
-        walk(n.a, x);
-        walk(n.b, x);
+        walk(n.a, x, massId, tool);
+        walk(n.b, x, massId, !tool); // the tool side is subtractive
         break;
       case "translate":
-        walk(n.child, { s: x.s, o: add(x.o, mul([val(n.t[0]), val(n.t[1]), val(n.t[2])], x.s)) });
+        walk(n.child, { s: x.s, o: add(x.o, mul([val(n.t[0]), val(n.t[1]), val(n.t[2])], x.s)) }, massId, tool);
         break;
       case "scale":
-        walk(n.child, { s: x.s * val(n.factor), o: x.o });
+        walk(n.child, { s: x.s * val(n.factor), o: x.o }, massId, tool);
         break;
       case "sphere":
       case "smoothUnion":
         throw new Error(`bsp: non-polyhedral op '${n.kind}' — route curved/smooth geometry to grid-DC (toMesh) or raymarch`);
     }
   };
-  walk(node, IDENTITY);
-  return prims;
+  walk(node, IDENTITY, nextMass++, false);
+
+  const massAabb = new Map<number, AABB>();
+  for (const prim of prims) {
+    if (massAabb.has(prim.massId)) continue;
+    const boxes = addBoxes.get(prim.massId);
+    // A mass bounded by additive boxes gets their (clamped) intersection; a box-less mass (bare
+    // half-spaces) is unbounded → the whole scene, so it never localises but stays correct.
+    massAabb.set(prim.massId, boxes ? aabbIntersect(boxes.reduce(aabbIntersect), scene) : scene);
+  }
+  return { prims, massAabb };
 }
 
 // ── convex-polygon clipping ─────────────────────────────────────────────────────────────
@@ -225,16 +290,22 @@ export interface Brep {
 export interface BrepOptions {
   /** Half-extent used to seed unbounded faces (bare half-spaces). Must enclose the solid. */
   bounds?: number;
+  /** Octree localisation kicks in once a scene has more than this many masses (union operands); below
+   *  it, evaluation is the plain global pass. Default 8. Set high to force the global pass, or low to
+   *  force the octree (used to differentially test the two agree). */
+  octreeMaxMasses?: number;
+  /** Max octree subdivision depth. Default 6. */
+  octreeMaxDepth?: number;
 }
 
 /** A canonical (deduplicated) geometric plane and the primitive faces lying on it. `n`/`d` fix one
  *  orientation; each owner records the sign of *its* outward normal relative to that (`+1` same, `−1`
  *  opposite) — how a union's back-to-back shared wall (opposite signs) is told from an intersection's
- *  shared cap (same sign). */
+ *  shared cap (same sign) — and the `massId` the octree filters planes by. */
 interface CanonPlane {
   n: Vec3;
   d: number;
-  owners: { primId: number; sign: number }[];
+  owners: { primId: number; massId: number; sign: number }[];
 }
 
 /** Merge the primitives' planes into canonical geometric planes (coincident planes collapsed), keeping
@@ -244,8 +315,8 @@ function canonicalPlanes(prims: Prim[], eps: number): CanonPlane[] {
   for (const prim of prims)
     for (const p of prim.planes) {
       const hit = canon.find((c) => samePlane(c, p, eps));
-      if (hit) hit.owners.push({ primId: prim.primId, sign: dot(hit.n, p.n) >= 0 ? 1 : -1 });
-      else canon.push({ n: p.n, d: p.d, owners: [{ primId: prim.primId, sign: 1 }] });
+      if (hit) hit.owners.push({ primId: prim.primId, massId: prim.massId, sign: dot(hit.n, p.n) >= 0 ? 1 : -1 });
+      else canon.push({ n: p.n, d: p.d, owners: [{ primId: prim.primId, massId: prim.massId, sign: 1 }] });
     }
   return canon;
 }
@@ -265,48 +336,110 @@ function pickOwner(canon: CanonPlane, sign: number, c: Vec3, prims: Prim[], tol:
   return (inside.length ? inside : pool).sort(byId)[0]?.primId ?? 0;
 }
 
+/** Six half-open half-spaces bounding `box`: inclusive on the min faces, exclusive on the max faces, so
+ *  a face lying on an octree cut is emitted by exactly one leaf (never doubled at the seam). */
+function boxClipPlanes(box: AABB, eps: number): { n: Vec3; d: number; e: number }[] {
+  return [
+    { n: [-1, 0, 0], d: -box.min[0], e: eps },
+    { n: [1, 0, 0], d: box.max[0], e: -eps },
+    { n: [0, -1, 0], d: -box.min[1], e: eps },
+    { n: [0, 1, 0], d: box.max[1], e: -eps },
+    { n: [0, 0, -1], d: -box.min[2], e: eps },
+    { n: [0, 0, 1], d: box.max[2], e: -eps },
+  ];
+}
+
+/** Evaluate one canonical `plane`'s boundary fragments and push their faces. The seed is optionally
+ *  clipped to a leaf `box`, then split by the given `splitters` (a plane never splits itself), and each
+ *  fragment kept iff it separates inside from outside — with the exact global SDF (`node`) as the in/out
+ *  oracle regardless of localisation, so classification is always exact. */
+function emitPlaneFaces(
+  node: Sdf,
+  plane: CanonPlane,
+  planeId: number,
+  splitters: CanonPlane[],
+  box: AABB | undefined,
+  prims: Prim[],
+  half: number,
+  eps: number,
+  nEps: number,
+  faces: BrepFace[],
+): void {
+  let frags = [seedQuad(plane, half)];
+  if (box) for (const cp of boxClipPlanes(box, eps)) frags = frags.map((f) => clipHalf(f, cp.n, cp.d, cp.e)).filter((f) => f.length >= 3);
+  for (const other of splitters) {
+    if (other === plane || samePlane(other, plane, eps)) continue;
+    const next: Vec3[][] = [];
+    for (const f of frags) {
+      const { inside, outside } = split(f, other.n, other.d, eps);
+      if (inside.length >= 3) next.push(inside);
+      if (outside.length >= 3) next.push(outside);
+    }
+    frags = next;
+  }
+  for (const f0 of frags) {
+    const f = dedupe(f0, eps);
+    if (f.length < 3) continue;
+    const c = centroid(f);
+    const insideNeg = evalSdf(node, sub(c, mul(plane.n, nEps))) < 0; // solid just on the −n side?
+    const insidePos = evalSdf(node, add(c, mul(plane.n, nEps))) < 0; // solid just on the +n side?
+    if (insideNeg === insidePos) continue; // buried (both) or floating (neither) — not on ∂S
+    const sign = insideNeg ? 1 : -1; // outward is +n exactly when the solid is on the −n side
+    const normal = insideNeg ? plane.n : mul(plane.n, -1);
+    const poly = insideNeg ? f : [...f].reverse();
+    faces.push({ poly, normal, primId: pickOwner(plane, sign, c, prims, nEps), planeId });
+  }
+}
+
+/** Octree leaves subdividing `box` until each overlaps at most `maxMasses` masses. A face is only ever
+ *  split/classified against the masses of the leaf it falls in, so distant masses never interact —
+ *  work drops from O(masses²) toward O(masses) for spread-out scenes. */
+function octreeLeaves(
+  box: AABB,
+  masses: { id: number; aabb: AABB }[],
+  maxMasses: number,
+  depth: number,
+): { box: AABB; masses: Set<number> }[] {
+  const here = masses.filter((m) => aabbOverlap(m.aabb, box, 1e-6));
+  if (here.length <= maxMasses || depth <= 0) return [{ box, masses: new Set(here.map((m) => m.id)) }];
+  return octants(box).flatMap((o) => octreeLeaves(o, here, maxMasses, depth - 1));
+}
+
 /** Evaluate the exact polyhedral boundary of `node`. Each *canonical* geometric plane is seeded once,
  *  split by every other canonical plane so each fragment is uniformly in/out of the whole solid, then
  *  kept iff it separates inside from outside — CSG boundary-by-classification with the exact SDF
  *  (`evalSdf`) as the in/out oracle. Visiting each plane once (not per-primitive) makes coincident faces
- *  a non-event: the plane's whole contribution is computed in one place, so nothing is doubled. */
+ *  a non-event. Beyond `octreeMaxMasses` union operands the work is localised through an octree (faces
+ *  split/classified only against the masses of the leaf they fall in); the result is identical — run
+ *  `mergeCoplanar` to stitch the per-leaf fragments back into whole faces. */
 export function evaluateBrep(node: Sdf, opts: BrepOptions = {}): Brep {
-  const prims = lower(node);
-  const half = (opts.bounds ?? 4) * 4; // seed quads well outside the solid; classification trims them
+  const bounds = opts.bounds ?? 4;
+  const half = bounds * 4; // seed quads well outside the solid; classification trims them
   const eps = 1e-7 * Math.max(half, 1);
-  const nEps = 1e-4 * Math.max(opts.bounds ?? 4, 1); // classification offset off the face plane
+  const nEps = 1e-4 * Math.max(bounds, 1); // classification offset off the face plane
+  const scene: AABB = { min: [-bounds, -bounds, -bounds], max: [bounds, bounds, bounds] };
+  const { prims, massAabb } = lower(node, scene);
   const canon = canonicalPlanes(prims, eps);
-
   const faces: BrepFace[] = [];
-  canon.forEach((plane, planeId) => {
-    // Split the seed by every OTHER canonical plane so each fragment is uniformly inside/outside the
-    // whole solid (a plane never splits itself — canonicalisation already merged coincident planes).
-    let frags = [seedQuad(plane, half)];
-    for (const other of canon) {
-      if (other === plane) continue;
-      const next: Vec3[][] = [];
-      for (const f of frags) {
-        const { inside, outside } = split(f, other.n, other.d, eps);
-        if (inside.length >= 3) next.push(inside);
-        if (outside.length >= 3) next.push(outside);
-      }
-      frags = next;
-    }
 
-    // Keep a fragment iff it separates inside from outside; orient its normal outward.
-    for (const f0 of frags) {
-      const f = dedupe(f0, eps);
-      if (f.length < 3) continue;
-      const c = centroid(f);
-      const insideNeg = evalSdf(node, sub(c, mul(plane.n, nEps))) < 0; // solid just on the −n side?
-      const insidePos = evalSdf(node, add(c, mul(plane.n, nEps))) < 0; // solid just on the +n side?
-      if (insideNeg === insidePos) continue; // buried (both) or floating (neither) — not on ∂S
-      const sign = insideNeg ? 1 : -1; // outward is +n exactly when the solid is on the −n side
-      const normal = insideNeg ? plane.n : mul(plane.n, -1);
-      const poly = insideNeg ? f : [...f].reverse();
-      faces.push({ poly, normal, primId: pickOwner(plane, sign, c, prims, nEps), planeId });
-    }
-  });
+  const maxMasses = opts.octreeMaxMasses ?? 8;
+  if (massAabb.size <= maxMasses) {
+    // Global pass: every plane against every other. Simple and exact; the right choice at small scale.
+    canon.forEach((plane, planeId) => {
+      emitPlaneFaces(node, plane, planeId, canon, undefined, prims, half, eps, nEps, faces);
+    });
+    return { faces };
+  }
+
+  // Localised pass: within each octree leaf, split/classify a plane only against the leaf's masses.
+  const masses = [...massAabb].map(([id, aabb]) => ({ id, aabb }));
+  const leaves = octreeLeaves(scene, masses, maxMasses, opts.octreeMaxDepth ?? 6);
+  const indexed = canon.map((plane, planeId) => ({ plane, planeId }));
+  for (const leaf of leaves) {
+    const local = indexed.filter(({ plane }) => plane.owners.some((o) => leaf.masses.has(o.massId)));
+    const localPlanes = local.map((l) => l.plane);
+    for (const { plane, planeId } of local) emitPlaneFaces(node, plane, planeId, localPlanes, leaf.box, prims, half, eps, nEps, faces);
+  }
   return { faces };
 }
 
