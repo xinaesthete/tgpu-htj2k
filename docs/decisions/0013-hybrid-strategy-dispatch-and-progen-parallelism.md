@@ -85,7 +85,24 @@ Therefore: **ornament that breaks the BSP routes to raymarch** in the hybrid (a 
   *overrides* — "this fluting is technically 200 planar facets, but raymarch it, it's cheaper as
   detail" — or carries LOD / importance the analysis cannot infer.
 
-### 6. Rust relevance tracks the algorithm (not an immediate priority)
+### 6. Lighting the raymarched surface (real PBR, positional lights) is viable
+
+The first cut (`raymarchMain.ts`) shades the meshed house and the raymarched growth with **one shared
+hand-shade node**, so they match. That was pragmatic, but an early note here wrongly implied real PBR
+with positional lights on the raymarched surface was only possible because the scene lights are
+directional. It isn't a constraint: the sphere-trace computes the **exact world-space hit position**,
+which is exactly what positional lighting needs. The hand-shade was a shortcut, not a necessity.
+
+Two routes to the real thing, both feeding `pHit` + gradient normal + material params into three's node
+lighting rather than approximating it: a **custom lighting node** (run the physical lighting model over
+the scene `lights([...])` with our geometric inputs — same BRDF, lights, and tone-mapping as the mesh,
+so they match by construction), or a **deferred G-buffer** (mesh and raymarch both write
+position/normal/albedo; one lighting pass covers all — more infrastructure, the clean answer at scale).
+The one genuinely harder part is **shadows**: *receiving* is a shadow-map sample at `pHit`; *casting*
+from raymarched geometry needs the shadow/depth passes to also march (the deferred route solves this
+uniformly). Target, not a blocker.
+
+### 7. Rust relevance tracks the algorithm (not an immediate priority)
 
 The earlier "rule out Rust" (see [ADR-0010](0010-procedural-geometry-composable-ops.md) discussion)
 was predicated on **grid-based** meshing, which is GPU-friendly and wants no native code. The original
