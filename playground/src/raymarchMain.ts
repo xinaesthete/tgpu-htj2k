@@ -33,7 +33,16 @@ import {
   wgslFn,
 } from "three/tsl";
 import { MeshBasicNodeMaterial, WebGPURenderer } from "three/webgpu";
-import { type AABB, aabbFinite, brepToMesh, evaluateBrep, type Implicit, mergeCoplanar, nonPlanarRegions, planarSkeleton } from "../../src/geometry";
+import {
+  type AABB,
+  aabbFinite,
+  brepToMesh,
+  evaluateBrep,
+  type Implicit,
+  mergeCoplanar,
+  nonPlanarRegions,
+  planarSkeleton,
+} from "../../src/geometry";
 import { hybridGrowth, hybridHouse } from "./geometryShapes";
 
 const RayResult = struct({ color: "vec4", depth: "float" });
