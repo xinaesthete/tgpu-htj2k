@@ -231,6 +231,30 @@ Stages 1–2 are the load-bearing ones; 3–5 are unblocked consequences.
   around it.
 - **Open (from the doc, still open):** how far intra-encoder ordering can be trusted before a submit
   is forced — needs a small Dawn/WebKit behaviour matrix, since we have been surprised once.
+- **Cancellation/interruption is unmodelled — across *all* ADRs, not just this one.** `pull`/`advance`
+  take no `AbortSignal` and there is no interruption path. Two things force it: executor
+  **pipelining** of independent branches (which `gpu-resource-sync.md` §Throughput already calls
+  for, so it arrives *with* Tier-2, not after), and **interactive re-pull supersession** — a brush
+  drag or param slider generates pulls that obsolete their predecessors, which is exactly the
+  problem sd.js currently solves by hand with abort signals and signature-staleness checks.
+  Falsifiable check to build *before* the machinery: **nodes executed after an abort == 0**.
+- **Graph-level streaming is unmodelled.** ADR-0004 states the *intent* ("large pulls fuse and
+  stream", dense-vs-lazy) and ADR-0008 streams **bytes** (progressive decode at the datasource);
+  nothing streams **computation**. Missing: a chunked/unbounded source, the **chunk-as-clock**
+  accumulator (an additive `splatDensity` into a resident grid *is* a fold, and the graph already
+  models folds via `feedback` — the clock is the chunk index rather than a sim tick), and an op
+  classification for what can be shown progressively: **(1) foldable state** (splat, counts,
+  moments); **(2) cheap derivations of that state** (`convolveSeparable`, `getisOrd`, `threshold`,
+  `emptySpace` — recomputable from the accumulator at any point, so displayable immediately);
+  **(3) neighbourhood-complete** (`kthNeighborDistance`/CkNN, `fuzzyAdjacency`, `vietorisRips`,
+  `anni` — need the full point set, or at least a spatial halo). Note Tier-1 actively **penalises**
+  progressive streaming in proportion to how progressive it is: every chunk round-trips the whole
+  accumulator, so transfers scale with chunk count. Falsifiable checks: **peak resident bytes
+  constant in N chunks**, and **zero downloads** when the sink is a render.
+- **Cross-tile / halo completeness is one problem wearing two hats.** A wand region growing across a
+  tile boundary and a category-(3) spatial statistic over a tiled point stream are both frontier
+  propagation over asynchronously-arriving neighbours. Neither is modelled; recorded here so it
+  isn't rediscovered.
 - **Browser backend parity — verify empirically, don't design for it speculatively.**
   `backend.browser.ts` will need the same lease API, but the honest test is a substantial compute
   task on a substantial data sample; treat parity as something to *measure* when such a workload
