@@ -1,7 +1,7 @@
 # ADR-0017 — Tier-2 resident buffer edges (implementing gpu-resource-sync invariants 1/3/4)
 
-Status: **accepted — stages 1–3 implemented** (proposed 2026-07-13, landed 2026-07-20).
-Stages 4–5 and the invariant-5 code change remain open; see *What stages 1–3 actually measured*.
+Status: **accepted — stages 1–3 + the invariant-5 amendment implemented** (proposed 2026-07-13,
+landed 2026-07-20). Stages 4–5 remain open; see *What stages 1–3 actually measured*.
 
 ## Context
 
@@ -217,11 +217,22 @@ allocation. Verified over 22 ticks: zero additional buffers. Three consequences 
   history has nothing to ping-pong; generalising it needs k+1 rotating buffers *and* an on-device
   path for `sample`'s interpolation. `delay` remains an explicit, documented host boundary.
 
-**Not done here, deliberately:** the invariant-5 amendment. `docs/gpu-resource-sync.md` already
-records the amended wording, but `runNode` still contains the `sanity → cpuGolden` fallback. It is
-not blocking — `allFinite` skips values with no host `data`, so resident outputs bypass it without
-forcing a download — and removing it changes error behaviour for every existing op, which deserves
-its own change.
+**Invariant 5 is now implemented too.** `runNode` runs `execute` and lets failures propagate; the
+`sanity → cpuGolden` fallback and the per-output `allFinite` scan are gone. `OpType.sanity` was
+removed with them — worth recording *why* it was safe: the only op that ever defined it was
+`vietorisRipsPersistence`, whose implementation was `return true`, i.e. it existed purely to opt
+out of the scan being deleted. Nothing used the mechanism to validate anything. `cpuGolden` stays
+as the test oracle and the `mode: "cpu"` implementation.
+
+**Backend parity is now tested** (`backendParity.gpu.test.ts`). This was the gap that let a real
+regression ship: every graph test relied on the executor's `ctx: opts.ctx ?? { backend: nodeBackend }`
+default, so no test ever passed an explicit `ctx` and the other two `GpuBackend` implementations
+were exercised by nothing. When this ADR added `lease`/`release`/`upload`/`poolStats` to the
+interface, `backend.browser.ts` was missed and the playground threw `backend.upload is not a
+function` on its first resident op. Two mitigations: the browser backend moved from `playground/`
+into `src/gpu/graph/`, so the root tsconfig actually typechecks it; and the new test runs the same
+resident graph through `nodeBackend`, an `adoptDevice`-wrapped backend, and `browserBackend`,
+asserting identical output and zero outstanding leases. Verified to fail on the original bug.
 
 ## Why
 

@@ -1,9 +1,9 @@
 // Executor for the operation graph.
 //
 // `pull(graph, field)` resolves the transitive dependencies of the requested field,
-// topologically orders them, and executes each node once (deduped), with per-node
-// validate→CPU-fallback (docs/gpu-resource-sync.md, invariant 5) and optional
-// content-addressed memoisation.
+// topologically orders them, and executes each node once (deduped), with optional
+// content-addressed memoisation. A failing op is a fail-state, not a fallback
+// (docs/gpu-resource-sync.md, invariant 5 as revised by ADR-0017): errors propagate.
 //
 // Feedback / time. The graph is a DAG *per tick*. A `feedback` (delay) node outputs
 // the PREVIOUS tick's value (seeded by `init`), so it acts as a source within a tick
@@ -18,7 +18,6 @@ import type { FieldValue, GpuField, ResidentBuffer } from "./handle";
 import type { GraphMemo } from "./memo";
 import { hashSource, hashString, stableJSON } from "./memo";
 import type { ExecCtx, OpType } from "./op";
-import { allFinite } from "./op";
 import { getOp } from "./registry";
 import { FieldRing } from "./ringBuffer";
 
@@ -112,10 +111,14 @@ async function runNode(
     if (!op.cpuGolden) throw new Error(`executor: op "${op.name}" has no cpuGolden (cpu mode)`);
     return op.cpuGolden(inputs, params);
   }
-  const out = await op.execute(ctx, inputs, params);
-  const ok = op.sanity ? op.sanity(out) : allFinite(out);
-  if (!ok && op.cpuGolden) return op.cpuGolden(inputs, params); // invariant 5: validate + fall back
-  return out;
+  // No validate-and-fall-back (gpu-resource-sync invariant 5, revised 2026-07-13). An op that
+  // cannot run on the GPU is a fail-state: whatever `execute` throws propagates, and the
+  // executor does not silently substitute a CPU result. The scan this used to do —
+  // `op.sanity ?? allFinite` over every element of every output — is incompatible with
+  // invariant 4, because reading every element forces a download on every pull. `cpuGolden`
+  // remains the test-time reference oracle and the `mode: "cpu"` implementation; it is not a
+  // production recovery path.
+  return op.execute(ctx, inputs, params);
 }
 
 interface TickOptions {

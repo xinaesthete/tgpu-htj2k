@@ -1,6 +1,8 @@
 // The operation abstraction: a named node type with typed input/output ports,
-// UI-discoverable params, shape inference, and an execute body. Optional
-// `cpuGolden`/`sanity` implement resource-sync invariant 5 (validate + fall back).
+// UI-discoverable params, shape inference, and an execute body. The optional
+// `cpuGolden` is the reference oracle tests validate `execute` against, and the
+// implementation `mode: "cpu"` runs — not a runtime fallback (resource-sync
+// invariant 5, as revised by ADR-0017).
 //
 // An `OpType` is backend-agnostic: `execute` receives a `GpuBackend` via the
 // context and resolved input `FieldValue`s, and returns output `FieldValue`s. The
@@ -93,11 +95,14 @@ export interface OpType {
   /** Run the op. Inputs are positional, matching `inputs`; outputs positional,
    *  matching `outputs`. */
   execute(ctx: ExecCtx, inputs: FieldValue[], params: Params): Promise<FieldValue[]>;
-  /** CPU reference (invariant 5). Pure; same positional contract as `execute`. */
+  /** CPU reference implementation. Pure; same positional contract as `execute`.
+   *
+   *  A **test-time oracle**, not a production fallback (gpu-resource-sync invariant 5, revised
+   *  by ADR-0017). It is what makes a kernel trustworthy — tests compare `execute` against it,
+   *  where an explicit download is free and correct — and it is what `mode: "cpu"` runs when a
+   *  caller deliberately asks for the reference path. The executor never substitutes it for a
+   *  failed GPU op: that is a fail-state and the error propagates. */
   cpuGolden?(inputs: FieldValue[], params: Params): FieldValue[];
-  /** Cheap output sanity gate (finite / plausible range). Returning false triggers
-   *  the CPU fallback when one is available. */
-  sanity?(outputs: FieldValue[]): boolean;
 }
 
 /** Resolve a param with its declared default. */
@@ -113,7 +118,10 @@ export function defaultParams(op: OpType): Params {
   return out;
 }
 
-/** A finite-numbers sanity check usable as a default `sanity` for numeric ops. */
+/** True when every host-resident output is all-finite. A **test** helper: the executor no
+ *  longer scans outputs (that would force a download on every pull, breaking invariant 4), so
+ *  this is for assertions, not the run path. Note it skips values carrying only a GPU `buffer`,
+ *  since checking those would mean downloading them. */
 export function allFinite(outputs: FieldValue[]): boolean {
   for (const o of outputs) {
     if (!o.data) continue;
