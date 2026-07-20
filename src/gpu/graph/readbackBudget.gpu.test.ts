@@ -14,6 +14,12 @@ import { installReadbackCounter, measureReadbacks, uninstallReadbackCounter } fr
 // the Tier-1 violation, measured.
 //
 // Own file ⇒ own fork (Dawn teardown isolation, ADR-0002/0003).
+//
+// RUNNING THIS. The table only prints with console intercept disabled — vitest's fork pool
+// swallows `console.log`:
+//   pnpm exec vitest run -c vitest.gpu.config.ts src/gpu/graph/readbackBudget.gpu.test.ts --disableConsoleIntercept
+// It must run under vitest: `tsx` cannot resolve typegpu's internals, so a standalone TS script
+// cannot import GPU ops. Vitest (with the unplugin-typegpu plugin) is the only vehicle.
 
 const W = 24;
 const H = 24;
