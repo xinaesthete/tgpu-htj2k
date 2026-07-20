@@ -79,6 +79,17 @@ export interface OpType {
    *  field). The executor then stamps the inferred basis onto runtime values, so
    *  generic ops carry a wavelet field through to `idwt` without knowing about it. */
   inferBasis?(inputs: Basis[], params: Params): Basis[];
+  /** Tier-2 opt-in (ADR-0017). When true, `execute` accepts inputs carrying `buffer` instead
+   *  of host `data` and is expected to return outputs that do the same — so an edge between two
+   *  resident ops never touches the host (invariant 4). Absent ⇒ host-only (Tier-1), today's
+   *  behaviour, which is what makes the migration incremental: the executor bridges between the
+   *  two representations, so a resident op and a host op can sit next to each other and every
+   *  unconverted op keeps working unchanged.
+   *
+   *  A resident op MUST lease its outputs from `ctx.backend.lease` rather than returning a
+   *  module-scoped scratch buffer: the executor owns the returned buffer's lifetime and will
+   *  release it once its last consumer has run. */
+  resident?: boolean;
   /** Run the op. Inputs are positional, matching `inputs`; outputs positional,
    *  matching `outputs`. */
   execute(ctx: ExecCtx, inputs: FieldValue[], params: Params): Promise<FieldValue[]>;

@@ -1,6 +1,7 @@
 # ADR-0017 — Tier-2 resident buffer edges (implementing gpu-resource-sync invariants 1/3/4)
 
-Status: **draft / proposed** (2026-07-13)
+Status: **accepted — stages 1–3 implemented** (proposed 2026-07-13, landed 2026-07-20).
+Stages 4–5 and the invariant-5 code change remain open; see *What stages 1–3 actually measured*.
 
 ## Context
 
@@ -152,17 +153,75 @@ Consequence: `docs/gpu-resource-sync.md` invariant 5 should be revised to say th
 ## Staging (each stage tightens the budget ratchet)
 
 - **Stage 0 — done.** `instrument.ts` + `readbackBudget.gpu.test.ts`; baseline `[1,2,3,4]`.
-- **Stage 1 — substrate, no op conversions.** `ResidentBuffer`, lease/release + DAG liveness,
-  `resident?` opt-in, executor bridge. Budget unchanged; full suite still green.
-- **Stage 2 — pilot, linear chain.** Convert `convolveSeparable` + `threshold` to resident. The
-  3-op chain drops **3 → 1** downloads — a directly measured win on the existing test.
-- **Stage 3 — resident feedback.** The HsPf-shaped case: ping-pong leases through a `feedback`
-  node, validated against HsPf's behaviour.
+- **Stage 1 — done.** Substrate, no op conversions. `ResidentBuffer`/`LeaseToken` on `FieldValue`
+  ([`handle.ts`](../../src/gpu/graph/handle.ts)), a liveness pool
+  ([`pool.ts`](../../src/gpu/graph/pool.ts)) behind `lease`/`release`/`upload`/`poolStats` on
+  `GpuBackend`, the `resident?` opt-in on `OpType`, and the executor bridge + DAG refcounting.
+  Budget unchanged at `[1,2,3,4]`; full suite green — as predicted.
+- **Stage 2 — done.** `convolveSeparable` + `threshold` converted. Budget `[1,2,3,4] → [1,2,2,2]`.
+- **Stage 3 — done.** Resident feedback ping-pong (see below).
 - **Stage 4 — resident render op.** ADR-0014's `surface(camera) → {position, normal, valid}` +
   `material` contract as a graph op consuming a resident field; no-download display.
 - **Stage 5 — retrofit satellites** (`sweptGpu`, `implicitGpu`, HsPf's kernel) onto resident edges.
 
 Stages 1–2 are the load-bearing ones; 3–5 are unblocked consequences.
+
+### What stages 1–3 actually measured (2026-07-20)
+
+**Stage 2's prediction was off by one, and the reason matters.** This ADR claimed the 3-op chain
+would drop 3 → 1. It dropped **3 → 2**, and `[1,2,3,4]` became `[1,2,2,2]`. Converting
+`convolveSeparable` and `threshold` removes every *interior* transfer, so the count stops growing
+with chain length — which is what invariant 4 actually asserts, and the budget test now asserts
+constancy directly rather than just pinning an array. But two downloads remain, and neither is an
+interior edge:
+
+1. **`splatDensity` is still Tier-1** and heads that chain. It renders to an r32float *texture*,
+   `copyTextureToBuffer`s into a 256-byte-row-aligned buffer, and de-pads **on the host**. Making
+   it resident needs the de-pad done on-device, so it is a real conversion, not a flag flip. This
+   is the single thing standing between `[1,2,2,2]` and `[1,1,1,1]`.
+2. **The sink**, which `pullData` downloads because the host genuinely consumes it — invariant 4
+   working as intended.
+
+On a chain with no Tier-1 source, the predicted numbers do hold exactly, and `resident.gpu.test.ts`
+asserts them: a host sink costs **1** download, and `pullResident` costs **0**.
+
+**Two hazards found while building it, both worth recording.**
+
+- **Wrapping a pooled buffer as a TypeGPU buffer makes the root a second owner of it**, and both
+  owners free it at teardown. That was harmless while readback targets were module-scoped
+  singletons — one wrapper each, created once — but a pool *recycles* buffers, so an uncached
+  wrap mints a fresh owner for the same Dawn handle on every download, and process exit then
+  double-frees it. This is a new way to reach the ADR-0002/0003 atexit segfault, created by the
+  pool itself. `backend.node.readbackF32` now caches one wrapper per buffer, and resident ops
+  build **raw** bind groups ([`residentBind.ts`](../../src/gpu/graph/residentBind.ts)) rather than
+  wrapping at all, so ownership stays with the pool.
+- **`hashSource`'s fallthrough was a correctness bug, not just a perf one.** A value with neither
+  `data` nor `payload` hashed to the constant `"empty"`, so *every* resident source would have
+  collided with every other and served wrong cache hits. Resident sources now key off object
+  identity. The ADR called this "forced, not optional"; it is more than that — it had to land in
+  stage 1, before any value could carry a buffer.
+
+**Ownership turned out to be the whole of stage 3.** Ping-pong is not implemented by handing ops a
+destination buffer (the op contract has ops lease their own outputs). Instead the feedback store
+*adopts* the incoming lease and *releases* the superseded one; because the pool is a free list,
+next tick's producer is handed back that very buffer. Two buffers alternate — HsPf's
+`[src, dst] = [dst, src]` expressed through the lease API, with no new op API and no per-tick
+allocation. Verified over 22 ticks: zero additional buffers. Three consequences fell out:
+
+- The executor needs an explicit **transfer of ownership** from tick to store, and a matching
+  `disposeSimState` — otherwise discarding a simulation strands a lease forever, since the pool
+  never destroys.
+- `feedback`/`delay` were **not decrementing their `init` refcount** at all (they `continue` past
+  the op path), so a resident `init` leaked one buffer per tick. Fixed.
+- **`delay` is deliberately left host-backed.** `FieldRing` stores host frames, so a depth-k
+  history has nothing to ping-pong; generalising it needs k+1 rotating buffers *and* an on-device
+  path for `sample`'s interpolation. `delay` remains an explicit, documented host boundary.
+
+**Not done here, deliberately:** the invariant-5 amendment. `docs/gpu-resource-sync.md` already
+records the amended wording, but `runNode` still contains the `sanity → cpuGolden` fallback. It is
+not blocking — `allFinite` skips values with no host `data`, so resident outputs bypass it without
+forcing a download — and removing it changes error behaviour for every existing op, which deserves
+its own change.
 
 ## Why
 

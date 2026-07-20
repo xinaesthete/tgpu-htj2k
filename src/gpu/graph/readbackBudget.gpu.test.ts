@@ -71,12 +71,31 @@ describe("resource-sync invariant 4 — boundary-only transfer", () => {
     // Every pull must download at least once — the sink itself.
     for (const r of rows) expect(r.downloads).toBeGreaterThanOrEqual(1);
 
-    // BASELINE RATCHET. Filled from the measured numbers below; tighten as Tier-2 lands.
-    // Under invariant 4 this whole array becomes [1, 1, 1, 1].
+    // THE INVARIANT ITSELF: downloads must not grow with chain length. Adding a resident op to
+    // the middle of a chain must cost zero transfers. This is the assertion that actually
+    // encodes invariant 4 — the ratchet below only pins the constant.
+    const beyondSource = rows.filter((r) => r.ops >= 2).map((r) => r.downloads);
+    expect(new Set(beyondSource).size).toBe(1);
+
+    // BASELINE RATCHET. Tighten as further ops convert; never loosen without saying why.
     expect(rows.map((r) => r.downloads)).toEqual(BASELINE_DOWNLOADS);
   });
 });
 
-// Measured on Dawn-on-Node. Downloads SHOULD be constant (1) per invariant 4; the growth
-// here is the Tier-1 interior-edge round-trip, quantified.
-const BASELINE_DOWNLOADS = [1, 2, 3, 4];
+// Measured on Dawn-on-Node.
+//
+// Was [1, 2, 3, 4] — one download per op, the Tier-1 interior-edge round-trip quantified.
+// ADR-0017 stage 2 converted `convolveSeparable` and `threshold` to resident ops, which
+// removed the *growth*: interior edges now stay on-GPU, so a 4-op chain costs exactly what a
+// 2-op chain does.
+//
+// Why 2 and not 1. Two ops download, and neither is an interior edge:
+//   1. `splatDensity` is still Tier-1. It is the chain's source, and it renders to an r32float
+//      texture, then `copyTextureToBuffer` into a 256-byte-row-aligned buffer and de-pads on
+//      the host. Making it resident needs that de-pad done on-device, so it is a real
+//      conversion rather than a flag flip — tracked separately.
+//   2. The sink, which `pullData` downloads because the host is genuinely consuming it. That
+//      one is invariant 4 working as intended, not a violation.
+// So the reachable target here is [1, 1, 1, 1] once splatDensity converts; a render-terminated
+// graph using `pullResident` should reach 0 (ADR-0017 §5).
+const BASELINE_DOWNLOADS = [1, 2, 2, 2];
