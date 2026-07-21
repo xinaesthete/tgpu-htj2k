@@ -168,22 +168,18 @@ Stages 1–2 are the load-bearing ones; 3–5 are unblocked consequences.
 
 ### What stages 1–3 actually measured (2026-07-20)
 
-**Stage 2's prediction was off by one, and the reason matters.** This ADR claimed the 3-op chain
-would drop 3 → 1. It dropped **3 → 2**, and `[1,2,3,4]` became `[1,2,2,2]`. Converting
-`convolveSeparable` and `threshold` removes every *interior* transfer, so the count stops growing
-with chain length — which is what invariant 4 actually asserts, and the budget test now asserts
-constancy directly rather than just pinning an array. But two downloads remain, and neither is an
-interior edge:
+**The ratchet reached `[1,1,1,1]`, in two steps.** Converting `convolveSeparable` and `threshold`
+took `[1,2,3,4]` → `[1,2,2,2]`: that removed every *interior* transfer, so the count stopped
+growing with chain length — which is what invariant 4 actually asserts, and the budget test now
+asserts constancy directly rather than just pinning an array. The two residual downloads were
+`splatDensity` (still Tier-1, heading the chain) and the sink. Converting `splatDensity`
+(below) removed the first, leaving **`[1,1,1,1]`**: the sink alone, which `pullData` downloads
+because the host genuinely consumes it — invariant 4 working as intended, not a violation. A
+render-terminated graph asking for `pullResident` performs **zero** downloads.
 
-1. **`splatDensity` is still Tier-1** and heads that chain. It renders to an r32float *texture*,
-   `copyTextureToBuffer`s into a 256-byte-row-aligned buffer, and de-pads **on the host**. Making
-   it resident needs the de-pad done on-device, so it is a real conversion, not a flag flip. This
-   is the single thing standing between `[1,2,2,2]` and `[1,1,1,1]`.
-2. **The sink**, which `pullData` downloads because the host genuinely consumes it — invariant 4
-   working as intended.
-
-On a chain with no Tier-1 source, the predicted numbers do hold exactly, and `resident.gpu.test.ts`
-asserts them: a host sink costs **1** download, and `pullResident` costs **0**.
+Note the ADR's stage-2 prediction of "3 → 1" was really a prediction about the whole chain, and
+only came true once the *source* converted too. Worth remembering when reading a staged plan: the
+op you convert is not always the op that is transferring.
 
 **Two hazards found while building it, both worth recording.**
 
@@ -223,6 +219,37 @@ removed with them — worth recording *why* it was safe: the only op that ever d
 `vietorisRipsPersistence`, whose implementation was `return true`, i.e. it existed purely to opt
 out of the scan being deleted. Nothing used the mechanism to validate anything. `cpuGolden` stays
 as the test oracle and the `mode: "cpu"` implementation.
+
+**`splatDensity` converted — and the near-miss is the lesson.** It renders to an r32float texture
+and `copyTextureToBuffer`s into a 256-byte-row-aligned staging buffer, so the row padding had to be
+stripped somewhere. That is now a small TGSL compute pass writing tightly-packed `w*h` into the
+leased output, and the vertex stage reads the graph's packed `[x0,y0,…]` points **directly** (the
+shader takes floats-per-point from its uniform: 3 for the host path's `(x,y,weight)`, 2 for the
+graph's points value), so no host repacking either.
+
+The de-pad kernel was wrong on the first attempt in a way **the budget test could not see**:
+`row = i / w` on `u32` operands transpiles to *float* division, so a fractional row scrambled the
+source index. Downloads read a perfect `[1,1,1,1]` while the grid itself was corrupt — total mass
+17.5 against the correct 58.0, the blob split across two wrong columns. The resolver did warn
+(`Implicit conversions from [params.rowFloats: u32] to f32`), which is worth heeding rather than
+scrolling past. Caught only because a *correctness* test compared the resident splat against the
+host path elementwise.
+
+**Generalising: a transfer-count ratchet measures transfers, not truth.** Every op converted under
+this ADR needs a paired numeric check, or the budget test will happily certify a fast, wrong graph.
+`residentValues.gpu.test.ts` compares the resident splat against `splatDensityGpu` — not against
+`cpuGolden`, deliberately: same render, same texture, so they should agree bit-for-bit (they do,
+`maxd = 0`), and any drift isolates exactly what the conversion touched. Splat's render path
+differs from the analytic CPU KDE by ~1.6e-2 regardless, which would have masked this bug entirely.
+The test uses a 24-wide grid on purpose — `24*4 = 96` bytes per row is *not* 256-aligned, so the
+padding is real; a 64-wide grid would be aligned by luck and exercise nothing.
+
+**Still host-coupled: the default `bbox`.** Deriving it from the points needs their values, so
+`splatDensity` falls back to the host array when no explicit `bbox` param is given. That works
+today only because the executor keeps `data` alongside `buffer` after an upload. A points value
+produced by an upstream *resident* op has no host array, and the op throws rather than silently
+downloading it — reading the points back is precisely the transfer this path exists to remove. The
+fix when that case arrives is a GPU min/max reduction, not a readback.
 
 **Backend parity is now tested** (`backendParity.gpu.test.ts`). This was the gap that let a real
 regression ship: every graph test relied on the executor's `ctx: opts.ctx ?? { backend: nodeBackend }`
