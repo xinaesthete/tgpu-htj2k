@@ -34,29 +34,28 @@ const MIN_BYTES = 256;
 /** WebGPU's `GPUBufferUsage` is installed as a global by device acquisition (see
  *  src/gpu/device.ts), so it cannot be read at module scope. Spec values are fixed, and are
  *  used as the fallback when the global is not yet present. */
-function bufferUsage(): { STORAGE: number; COPY_SRC: number; COPY_DST: number; VERTEX: number } {
+function bufferUsage(): { STORAGE: number; COPY_SRC: number; COPY_DST: number } {
   const U = (globalThis as unknown as { GPUBufferUsage?: Record<string, number> }).GPUBufferUsage;
   return {
     STORAGE: U?.STORAGE ?? 0x80,
     COPY_SRC: U?.COPY_SRC ?? 0x04,
     COPY_DST: U?.COPY_DST ?? 0x08,
-    VERTEX: U?.VERTEX ?? 0x20,
   };
 }
 
-/** The default *resident class*: readable and writable by compute, and copyable in both
- *  directions so a value can be uploaded at a source and downloaded at a sink. Over-provisioning
- *  here is essentially free — these flags are mostly a placement hint and such buffers live in
- *  device-local memory regardless. */
+/** The *resident class*: readable and writable by compute, and copyable in both directions so a
+ *  value can be uploaded at a source and downloaded at a sink. Over-provisioning here is
+ *  essentially free — these flags are mostly a placement hint and such buffers live in
+ *  device-local memory regardless.
+ *
+ *  `lease` takes an arbitrary `usage`, so a class the pool doesn't name (e.g. `| VERTEX` for
+ *  geometry a render pass binds) works today by passing it explicitly; the pool keys its free
+ *  lists on the flags, so classes never alias. Whether VERTEX should simply be folded in here is
+ *  open — see ADR-0017's consequences. There is deliberately no named vertex class until
+ *  something in the graph actually needs one. */
 export function residentUsage(): number {
   const U = bufferUsage();
   return U.STORAGE | U.COPY_SRC | U.COPY_DST;
-}
-
-/** The resident class plus `VERTEX`, for geometry a render pass binds directly
- *  (ADR-0010-geometry / ADR-0014). Kept a separate class so ordinary fields don't pay for it. */
-export function residentVertexUsage(): number {
-  return residentUsage() | bufferUsage().VERTEX;
 }
 
 /** Round up to the next power of two, floored at `MIN_BYTES`. */

@@ -90,7 +90,13 @@ export interface OpType {
    *
    *  A resident op MUST lease its outputs from `ctx.backend.lease` rather than returning a
    *  module-scoped scratch buffer: the executor owns the returned buffer's lifetime and will
-   *  release it once its last consumer has run. */
+   *  release it once its last consumer has run.
+   *
+   *  ONE LEASE PER OUTPUT PORT. The executor tracks ownership per `(node, port)`, so a
+   *  multi-output resident op works — but each output must carry its *own* lease. Returning the
+   *  same `ResidentBuffer` on two ports makes the executor release it twice, which the pool
+   *  rejects (a double release means two live values would share one buffer). Alias by copying,
+   *  or emit one port and let a downstream op derive the rest. */
   resident?: boolean;
   /** Run the op. Inputs are positional, matching `inputs`; outputs positional,
    *  matching `outputs`. */

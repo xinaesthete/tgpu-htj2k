@@ -3,7 +3,7 @@ import { getDevice } from "../device";
 import { nodeBackend } from "./backend.node";
 import { advance, createSimState, disposeSimState, Graph, pull, pullResident, simStateBytes } from "./index";
 import { installReadbackCounter, measureReadbacks, uninstallReadbackCounter } from "./instrument";
-import { BufferPool, residentUsage, residentVertexUsage } from "./pool";
+import { BufferPool, residentUsage } from "./pool";
 import { FieldRing } from "./ringBuffer";
 
 // ADR-0017 stages 1-3. `readbackBudget.gpu.test.ts` proves the per-op transfers stopped happening
@@ -88,10 +88,13 @@ describe("BufferPool — lease/release by liveness", () => {
     pool.release(small);
     expect(pool.lease(4096).buffer).not.toBe(small.buffer);
 
-    // Nor may a VERTEX lease reuse a resident-class buffer: it physically lacks the flag.
+    // Nor may a lease of a DIFFERENT usage class reuse a resident-class buffer — it physically
+    // lacks the extra flag. VERTEX stands in for any class the pool doesn't name; callers pass
+    // such flags explicitly (see `residentUsage`'s note), and the free lists must keep them apart.
+    const VERTEX = (globalThis as unknown as { GPUBufferUsage: Record<string, number> }).GPUBufferUsage.VERTEX!;
     const plain = pool.lease(2048, residentUsage());
     pool.release(plain);
-    expect(pool.lease(2048, residentVertexUsage()).buffer).not.toBe(plain.buffer);
+    expect(pool.lease(2048, residentUsage() | VERTEX).buffer).not.toBe(plain.buffer);
   });
 
   it("throws on double release rather than corrupting the free list", () => {

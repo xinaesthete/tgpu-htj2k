@@ -279,11 +279,33 @@ asserting identical output and zero outstanding leases. Verified to fail on the 
 - **The `resident?` bridge can mask regressions** — an op silently falling back to host download
   looks correct. Mitigation: the budget ratchet, plus a debug mode that logs every executor-inserted
   materialisation with its node id.
+- **KNOWN LIMITATION — the bridge cannot produce a non-default usage class.** `residentAt` calls
+  `backend.upload(v.data)` with no `usage` argument, so a host value bridged into a resident op
+  always lands in the default resident class. An op needing e.g. `| VERTEX` (geometry a render pass
+  binds — `hornMutator.ts` does exactly this via `setVertexBuffer`) will therefore be handed a
+  buffer that *physically lacks the flag*, and the pool correctly refuses to substitute one, since
+  free lists are keyed on usage. The op's own leases are fine — only the **bridged input** is
+  affected. This is latent until the first geometry op; the fix is additive (an optional usage hint
+  on `PortSpec`, or threading `usage` through the bridge), and is called out here so it is designed
+  rather than rediscovered.
+- **Open: should `residentUsage()` simply include `VERTEX`?** A named vertex class was written and
+  then **removed** before merge — nothing in the graph reached it, and shipping speculative API is
+  worse than adding it on demand. `lease` still takes arbitrary flags, so the capability exists.
+  The real question is whether the split is worth having at all: this ADR already argues
+  over-provisioning *within* the resident class is essentially free (flags are mostly a placement
+  hint; these buffers are device-local either way), which points at folding VERTEX in and having
+  **one** pooled class. Against: it is a guess until a real geometry workload measures it. Decide
+  when stage 5 lands, with a workload in hand.
+- **One lease per output port.** The executor tracks ownership per `(node, port)`, so a
+  multi-output resident op works — but each output must carry its own lease. Returning the same
+  `ResidentBuffer` on two ports double-releases, which the pool rejects. Recorded in
+  `OpType.resident`'s contract; **untested**, since all three resident ops today are single-output
+  (`reactionDiffusion`, `bodyTap` and `integrate` are the multi-output ops, none of them resident).
 - **Buffer usage flags — resolved: split the pool by mappability.** WebGPU *forbids* combining
   mappable and non-mappable usage (`MAP_READ` may combine with nothing but `COPY_DST`; `MAP_WRITE`
   with nothing but `COPY_SRC`), so `STORAGE | MAP_READ` is invalid — there is no universal buffer to
-  over-provision toward. Therefore: a **resident class** (`STORAGE | COPY_SRC | COPY_DST`, plus
-  `VERTEX` where geometry needs it) that is pooled and aliased, where over-provisioning is
+  over-provision toward. Therefore: a **resident class** (`STORAGE | COPY_SRC | COPY_DST`; whether
+  `VERTEX` joins it is left open above) that is pooled and aliased, where over-provisioning is
   essentially free (the flags are mostly a placement hint and these live in device-local memory
   regardless); and a **staging class** (`MAP_READ | COPY_DST`) created short-lived at the download
   boundary, never pooled — which is what TypeGPU's `.read()` already does internally. The cost to

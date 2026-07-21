@@ -51,7 +51,7 @@ export type { ExecCtx, OpHelp, OpType, ParamSpec, Params, ParamType, PortSpec } 
 export { allFinite, defaultParams, param } from "./op";
 export { registerBuiltinOps, registerElementOps, registerWaveletOps } from "./ops/index";
 export type { PoolStats } from "./pool";
-export { BufferPool, residentUsage, residentVertexUsage } from "./pool";
+export { BufferPool, residentUsage } from "./pool";
 export { getOp, hasOp, listOps, registerOp } from "./registry";
 export { FieldRing, RingBuffer } from "./ringBuffer";
 

@@ -33,8 +33,9 @@ export interface GpuBackend {
   // --- Tier-2 resident pool (ADR-0017, invariant 3) ---
 
   /** Lease a resident buffer of at least `byteLength` bytes from the pool. Defaults to the
-   *  resident usage class (`STORAGE | COPY_SRC | COPY_DST`); pass `residentVertexUsage()` for
-   *  geometry a render pass binds. */
+   *  resident usage class (`STORAGE | COPY_SRC | COPY_DST`); pass explicit flags for a class the
+   *  pool doesn't name (e.g. `| VERTEX`). Free lists are keyed on the flags, so classes never
+   *  alias — a lease can only be served by a buffer physically created with the same usage. */
   lease(byteLength: number, usage?: number): Promise<ResidentBuffer>;
   /** Return a leased buffer to the pool. NEVER destroys it — mid-process destruction
    *  segfaults Dawn-on-Node (ADR-0002/0003). */
