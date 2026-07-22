@@ -1,6 +1,8 @@
 # ADR-0018 — Field domains: extent, placement, and resolution as carried facets
 
-Status: **draft / proposed** (2026-07-21) — written for reaction, not yet agreed.
+Status: **draft / proposed** (2026-07-21) — written for reaction. **Decision 2 (resolution is
+derived, never stored) is agreed** (2026-07-21); the rest is still open, in particular the
+build-time-vs-run-time placement question and whether points carry a full placement.
 
 ## Context
 
@@ -77,7 +79,7 @@ interface FieldValue {
 
 `ResolvedPlacement` is ADR-0015's, unchanged and still **consumed**, not composed here.
 
-### 2. Resolution is derived, never stored.
+### 2. Resolution is derived, never stored. **(agreed 2026-07-21)**
 
 There is no third facet. Given a domain (sample counts) and a placement (affine to world), cell size
 falls out:
@@ -92,6 +94,14 @@ This matters because it identifies the **invariant across a multiscale pyramid**
 the relation ADR-0008's level selection needs and cannot currently express, and the one
 ADR-0004's scale-equivariance is about — a filter with a world-unit σ must produce the same result
 at any level.
+
+**What being agreed forecloses.** No `cellSize`, `resolution`, `pixelSize` or `bbox` field may be
+added to `FieldValue`, `GpuField`, `Shape`/`Domain`, or a `Multiscale` level descriptor — each would
+be a second source of truth that can disagree with `domain × placement`, and the disagreement is
+silent (a resampling op that updates one and not the other produces a field that is wrong about
+where it is). Where a hot path wants the number, it is a **derived accessor** over the two facets,
+not a stored field. Corollary: a resample op changes `domain` and the scale part of `placement`
+together, in one place; if that ever needs to be two writes, this decision is being violated.
 
 ### 3. `bbox` becomes a placement constructor at sources, not a free parameter.
 
