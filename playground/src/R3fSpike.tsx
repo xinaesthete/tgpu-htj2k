@@ -1,7 +1,16 @@
 // Slice-0 spike — does react-three-fiber carry the WebGPU backend well enough to host the
 // serial-section scene editor's multi-viewport shell?
 //
-// VERDICT: yes, with one shim. Measured in-browser on three r185 / R3F 9.6.1 / drei 10.7.7:
+// LIFETIME: this page is a spike, kept only until something real is built on R3F (the viewer-layer
+// promotion out of `playground/` — see `docs/packaging-and-consumers.md`). Delete it then; until
+// then it is the only place R3F is exercised, so it doubles as a smoke-test of the WebGPU path.
+// The findings below are its durable output and also live in
+// `docs/serial-section-alignment-and-multi-viewport.md` §7.
+//
+// VERDICT: yes, with one shim. Measured in-browser on three r185 / R3F 9.6.1 / drei 10.7.7.
+// The page checks the three revision at runtime and says so if it has moved — a spike that is not
+// re-run acquires false authority, and the `WebGPURenderer` scissor Y-flip in particular is the kind
+// of thing that may be fixed upstream, silently invalidating §3 below.
 //
 //   1. ASYNC RENDERER — PASS. R3F v9's `gl` prop accepts `(defaultProps) => Promise<Renderer>`;
 //      `await renderer.init()` inside it works and reports `backend: WebGPU` (not a WebGL fallback).
@@ -51,6 +60,10 @@ declare module "@react-three/fiber" {
 
 /** Edit this string and save to exercise Fast-Refresh — see criteria 2 and 4a. */
 const MARKER = "edit me, save, and watch the counters (renderer builds must stay 1)";
+
+/** The three revision the findings in the header were actually measured against. If the installed
+ *  revision has moved past this, the page says so — see the LIFETIME note above. */
+const VERIFIED_AGAINST_THREE_REVISION = "185";
 
 // Counters live on globalThis so a Fast-Refresh module re-evaluation does NOT reset them; that is
 // the whole measurement. A module-level `let` would zero itself and always report "one build".
@@ -224,6 +237,17 @@ export default function R3fSpike(): React.JSX.Element {
       <header style={{ flex: "0 0 auto" }}>
         <h2 style={{ margin: "0 0 2px", fontSize: 15 }}>Spike — react-three-fiber on the WebGPU backend</h2>
         <p style={{ margin: 0, color: "#94a3b8", fontSize: 12 }}>{MARKER}</p>
+        {THREE.REVISION === VERIFIED_AGAINST_THREE_REVISION ? (
+          <p style={{ margin: "2px 0 0", color: "#64748b", fontSize: 11 }}>
+            three r{THREE.REVISION} — findings in the source header were measured against this revision.
+          </p>
+        ) : (
+          <p style={{ margin: "2px 0 0", color: "#fbbf24", fontSize: 11 }}>
+            ⚠ three is now <b>r{THREE.REVISION}</b>, but the findings were measured against r{VERIFIED_AGAINST_THREE_REVISION}. Re-run this
+            page before trusting them — the
+            <code> WebGPURenderer</code> scissor Y-flip especially may have been fixed upstream.
+          </p>
+        )}
         <div style={{ marginTop: 6, display: "flex", gap: 14, flexWrap: "wrap", fontSize: 12, color: "#cbd5e1" }}>
           <span>
             backend: <b style={{ color: report?.backend === "WebGPU" ? "#4ade80" : "#f87171" }}>{report?.backend ?? "…"}</b>
