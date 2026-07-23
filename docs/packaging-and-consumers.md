@@ -35,7 +35,7 @@ not want it**. By that test there are three, so:
 |---|---|---|
 | **`@intraspatial/core`** | all of `src/`, subpath exports: `/datasource`, `/spatial`, `/geometry`, `/graph`, `/color`, `/evo` | typegpu (peer); **no** three, deck, or Dawn |
 | **`@intraspatial/viewer-three`** | the three.js layer promoted out of `playground/`: tile renderer, channel composite, camera controls, `Viewport` shell | three (peer) |
-| **`@intraspatial/viewer-deck`** | deck.gl interop — layers over the same datasource/ops | deck.gl, luma.gl (peer) |
+| **`@intraspatial/viewer-deck`** | deck.gl interop — layers over the same datasource/ops, sharing one `GPUDevice` with `viewer-three` | deck.gl, luma.gl (peer) |
 
 Not six packages, one per `src/` subdirectory: every extra package is release overhead, and
 subpath exports give the same import ergonomics without it. Split `core` further only when a real
@@ -57,30 +57,70 @@ yet: it is a fiddly dependency tree and less pleasant to prototype against than 
 those are arguments for the seam rather than against the dependency — consumers who want deck opt in,
 and nobody else pays.
 
-**The interop question is the thing to spike, and it is not obviously easy.** Two shapes:
+**The target is shared-framebuffer integration** — one `GPUDevice`, deck layers and three geometry
+interleaved with a common depth buffer — not two stacked canvases with synchronised cameras. Facts
+checked 2026-07-23:
 
-- **Two canvases, synchronised cameras.** deck renders its layers, three renders the scene, and a
-  shared camera state drives both. Simple, robust, no shared context — but compositing is by DOM
-  stacking, so there is no true depth interleaving between deck layers and three geometry.
-- **One context, interleaved.** deck supports rendering into an externally-owned context; this is
-  how deck-on-Mapbox works. It gives real interleaving, and it requires both sides to agree on a
-  graphics API.
+**Both device-sharing primitives already exist.**
 
-**The constraint that probably decides it, and which must be verified first:** this repo is
-committed to **WebGPU** (three's `WebGPURenderer`, TSL node materials, TypeGPU compute), while deck.gl
-is built on luma.gl and has historically been WebGL2-first, with WebGPU support experimental. If that
-is still true, then one-context interleaving is simply unavailable and the answer is two canvases
-with synchronised cameras — which in turn makes `viewer-deck` a thin package (camera-state adapter +
-layer factories over `@intraspatial/core` data) rather than a rendering integration.
+- **luma.gl:** `luma.attachDevice(handle: WebGL2RenderingContext | GPUDevice | null, {adapters,
+  ...deviceProps})`, documented explicitly as the way to *"interleave rendering with other GPU
+  libraries"*. A `GPUDevice` is an accepted handle.
+- **three.js r185:** `WebGPUBackend.init()` reads `parameters.device` — *"create the device if it is
+  not passed with parameters"* (`WebGPUBackend.js:209`) — and `parameters.context` for an
+  externally-configured canvas context (`:336`). It also only destroys the device if it created it
+  (`:2903`). So `new WebGPURenderer({ device, context })` is supported today.
 
-So the spike, in order:
+So the hard part is **not** device sharing. It is deck's side of the render pass.
 
-1. What is deck.gl/luma.gl's actual WebGPU status now? This single fact decides the architecture.
-2. Can a deck `Deck` instance and a three `WebGPURenderer` share a camera convincingly, including
-   during interaction? The camera state model in ADR-0019 (`{pivot, orientation, distance}`) is the
-   natural shared representation, and it is API-agnostic.
-3. What is the smallest useful deck layer over our data — probably points/shapes from a SpatialData
-   element, coloured by a spatial-stat op output.
+**The real gaps, from deck's own WebGPU docs:**
+
+- **WebGPU support is "still a work in progress and is not production ready"**, landing layer by
+  layer. Ported: `ScatterplotLayer`, `PointCloudLayer`, `PathLayer`, `LineLayer`, `IconLayer`.
+  Everything else — `PolygonLayer`, `GeoJsonLayer`, `TextLayer`, `BitmapLayer`, `ArcLayer`, all
+  aggregation and geo layers — is WebGL-only.
+- **Picking is skipped entirely on WebGPU**, "including hover and click picking paths".
+- **All `@deck.gl/extensions` are WebGL-only** (GLSL injection, GLSL-only shader modules, extra
+  render/picking passes).
+- **"No current base map integration path"** supporting WebGPU interleaving or transparent overlays —
+  i.e. the deck-on-Mapbox interleaving pattern has no WebGPU equivalent yet. This is the specific
+  thing shared-framebuffer integration needs.
+
+**Two of those are unusually favourable for us.** The ported layer set is very nearly exactly what
+spatial-data work wants: cells as `ScatterplotLayer`/`PointCloudLayer`, boundaries as `PathLayer`.
+And the missing piece we would feel first — picking — is something this repo is building anyway
+(ADR-0019 §5's `pick()`), over data we own rather than over deck's layer state.
+
+**The concrete asks, if we contribute upstream.** Shared-framebuffer interleaving needs deck to,
+on WebGPU:
+
+1. render into a caller-supplied colour **and depth** attachment rather than owning the canvas
+   context (the WebGPU analogue of the base-map interleaving path);
+2. expose `loadOp` control so a deck pass does not clear what three already drew;
+3. agree a depth-texture format and sample count with the host renderer;
+4. agree a projection/depth convention, so the two sides' clip-space output is comparable — this is
+   the substantive one, since deck's `project` module carries its own coordinate-system machinery;
+5. (eventually) WebGPU picking, or a documented way to opt out and supply picking from the host.
+
+Items 1–3 are mechanical; 4 is a design conversation; 5 may not block us at all.
+
+**The spike, in order:**
+
+1. One `GPUDevice`, `luma.attachDevice` on it, three's `WebGPURenderer({ device })` on the same one —
+   confirm both render at all without fighting over the canvas context.
+2. Interleave in one pass: can deck be persuaded to render into a texture view we own, with
+   `loadOp: 'load'` and our depth attachment? This is where the gap is expected, and where a patch
+   would go.
+3. Depth agreement: put a `ScatterplotLayer` and a three mesh at known depths and check occlusion is
+   correct from both sides.
+4. Then the useful thing — a SpatialData element as a deck layer coloured by a `src/gpu/spatial` op
+   output.
+
+Sources for the above (checked 2026-07-23; deck's WebGPU surface moves quickly, so re-check before
+relying on any of it): [deck.gl WebGPU developer guide](https://deck.gl/docs/developer-guide/webgpu),
+[luma.gl `luma.attachDevice`](https://luma.gl/docs/api-reference/core/luma),
+[luma.gl WebGPU adapter](https://luma.gl/docs/api-reference/webgpu); three.js
+`src/renderers/webgpu/WebGPUBackend.js` at r185.
 
 ## Sequencing
 
@@ -91,8 +131,14 @@ So the spike, in order:
    becomes a consumer of the package rather than its owner — which also proves the surface is real.
 3. **Bridge SpatialData elements → `src/gpu/spatial` ops**, on a real 2-D store. This is the thing
    that makes the whole enterprise believable, and the audit says it is a bridge, not a build.
-4. **Then** the deck spike, informed by (3) — because the first genuinely useful deck layer is a
-   spatial-stat result, and it is easier to design the seam once there is something to put through it.
+4. **The deck interleaving spike.**
+
+Steps 1–2 of the deck spike (shared device, then interleaving) are cheap and independent of the rest,
+and they are the ones that would surface a gap worth raising upstream. Given an imminent deck.gl
+developer summit — where this work is to be presented alongside sd.js/MDV — there is a good argument
+for running them *early and out of order*, purely to arrive with a measured result rather than a
+question. A one-day answer to "does three-on-WebGPU interleave with deck-on-WebGPU, and exactly where
+does it stop?" is worth more in that room than a finished package.
 
 ## Open questions
 

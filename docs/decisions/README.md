@@ -77,3 +77,7 @@ Roughly **8 landed, 6 partial, 6 open**.
   space, fuzzy adjacency (+ adaptive), Getis-Ord, kth-neighbour distance, NN distance, splat density.
   Running spatial statistics on real data is blocked on a *bridge from SpatialData elements*, not on
   missing ops.
+- **Sharing one `GPUDevice` between three.js and deck.gl/luma.gl is already possible** — three's
+  `WebGPUBackend` accepts `parameters.device`/`parameters.context`, and `luma.attachDevice` takes a
+  `GPUDevice` explicitly for interleaving. What is missing is on deck's side (no WebGPU interleaving
+  path, no WebGPU picking). Details in [`packaging-and-consumers.md`](../packaging-and-consumers.md).
