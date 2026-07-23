@@ -8,7 +8,7 @@ The multi-image scene editor (`playground/src/datasource/multiImageScene.ts`, AD
 1b) puts N SpatialData images in one WebGPU scene with a per-image gizmo. It was built for
 *co-registration* — two modalities of the same slide. The next application is different in kind:
 **serial sections of one specimen, hand-aligned into a 3-D stack**, so that features can be picked
-per section and lofted into geometry (ADR-0021).
+per section and lofted into geometry (the [wand note](../wand-contours-and-lofted-geometry.md)).
 
 ### The data this is designed against
 
@@ -85,8 +85,9 @@ Three sub-decisions, each with a reason that is not aesthetic:
 
 ### 2. Two persisted objects, split by failure mode
 
-- **`SceneDocument`** — the data: per-image `ImageAlignment`, channel/stain settings, and (ADR-0021)
-  the contours and tubules. **Speaks NGFF natively**: transformations are serialised in the
+- **`SceneDocument`** — the data: per-image `ImageAlignment`, channel/stain settings, and — if the
+  [wand note](../wand-contours-and-lofted-geometry.md) is ever built — contours and tubules.
+  **Speaks NGFF natively**: transformations are serialised in the
   `coordinateTransformations` vocabulary the store already uses, contours as polygon geometry. Strict
   validation; a parse failure is surfaced, never swallowed.
 - **`Workspace`** — the UI: mosaic layout, per-viewport camera pose and mode, grid/onion toggles,
@@ -163,7 +164,7 @@ quaternion fix is portable back to psychogeo as separate work.
 pick(viewport, px, py) → { worldPoint, imageId, arrayXY, geometryHit? } | null
 ```
 
-`worldPoint` serves the camera pivot; `imageId + arrayXY` serves the wand (ADR-0021), image
+`worldPoint` serves the camera pivot; `imageId + arrayXY` serves the wand (the [wand note](../wand-contours-and-lofted-geometry.md)), image
 selection, and the hover readout; `geometryHit` serves ADR-0012 `resolve`. One raycast, one
 world→array inverse (the effective matrix already exists), one place that understands
 viewport-local coordinates. Camera work can land first using only `worldPoint`.
@@ -252,12 +253,12 @@ per-section warping beyond a single affine; orthographic `select()`; the depth-b
   `src/datasource` change and the selector is a one-system special case until then.
 - **Eviction fights coarse-tile retention.** A culled-but-resident coarse tile is exactly what you
   want to keep (it is the fallback when you zoom out) and exactly what a naive evictor drops first.
-  This interacts with ADR-0020's coarse-tile culling and is the fiddliest part of the budget work.
+  This interacts with the [stain-space note](../stain-space-and-stack-transparency.md)'s coarse-tile culling and is the fiddliest part of the budget work.
 - **Procedural tile deformation would break raycast picking.** Warping tiles — which is what
   non-rigid section registration eventually wants — invalidates the flat `pickPlane` raycast. The
   `pick()` signature is the seam; the implementation would move to depth-unprojection or a GPU
   picking pass, which is ADR-0012's answer anyway. It also interacts badly with plane-splitting
-  (ADR-0020).
+  (the [stain-space note](../stain-space-and-stack-transparency.md)).
 - **Uncapped viewports are a deliberate experiment.** Each costs a scene traversal and a render pass
   and widens the union. If the honest answer turns out to be "cap at 4", the budget work is what will
   tell us.

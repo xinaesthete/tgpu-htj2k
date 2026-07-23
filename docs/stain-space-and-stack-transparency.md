@@ -1,6 +1,17 @@
-# ADR-0020 — Stain-space channels, transparency ordering, and the comparator registry
+# Stain-space channels, transparency ordering, and the comparator registry
 
-Status: **draft / proposed** (2026-07-23) — written to be edited by what ADR-0019 teaches.
+Status: **design note** (2026-07-23)
+
+> Written as ADR-0020 and **demoted the same day**. The ADR audit
+> ([`decisions/README.md`](decisions/README.md)) found that every decision record written *about
+> direction* rather than about work in flight has gone unimplemented — giving speculation the form of
+> a decision is what turns the log into a source of guilt rather than a map. Nothing below is
+> withdrawn; it is simply not being built yet, and a design note is the honest home for that. It
+> becomes an ADR the day someone starts implementing it.
+>
+> Two parts are load-bearing sooner than the rest and may be extracted early: the
+> **transparency-ordering change with coarse-tile culling** (§3), which is a prerequisite for *any*
+> transparent stack, and the **comparator registry** (§5), which is useful well beyond H&E.
 
 ## Context
 
@@ -12,8 +23,8 @@ turn out to be the same problem.
 nadir lightbox cannot compare a section against its neighbour. Making white transparent is not a
 nicety here; without it the multi-viewport shell has nothing useful to show.
 
-**Feature selection.** ADR-0021's wand has to pick "the same glomerulus" on six differently-stained
-slides. Inter-section stain variation is the most notorious artefact in serial histology, and a
+**Feature selection.** The wand (see the [wand note](wand-contours-and-lofted-geometry.md)) has to
+pick "the same glomerulus" on six differently-stained slides. Inter-section stain variation is the most notorious artefact in serial histology, and a
 selection metric computed on raw RGB will chase it. So the wand needs a colour representation in
 which "which stain" is separable from "how much stain and how dark this slide came out".
 
@@ -90,7 +101,7 @@ B is a way-station and is labelled as one. The honest cost: it inserts a compute
 tile-arrival path that currently goes straight from decode to `texture.needsUpdate`, and it must not
 stall streaming.
 
-A CPU twin of the unmix exists for the wand (ADR-0021), pinned by a parity test. That duplication is
+A CPU twin of the unmix exists for the wand (the [wand note](wand-contours-and-lofted-geometry.md)), pinned by a parity test. That duplication is
 the established pattern in this repo — `applyTransform` in `swept.ts` is explicitly "the CPU image of
 its WGSL codegen", and `implicit`/`implicitGpu`, `swept`/`sweptGpu`, `backendParity.gpu.test.ts` all
 work this way — not an accident to be cleaned up.
@@ -225,7 +236,8 @@ comparators authored as ADR-0007 expressions.
 
 ## References
 
-- **[in-repo]** ADR-0019 (the scene this serves), ADR-0021 (the wand that consumes the derived
+- **[in-repo]** ADR-0019 (the scene this serves), the
+  [wand note](wand-contours-and-lofted-geometry.md) (the wand that consumes the derived
   channels and the comparators), ADR-0009 (rendering as ops — B is a way-station to C), ADR-0015
   (channel axis, `omero` channel entries, label polarity), ADR-0004 (element ⊥ axes — why comparators
   are defined over N-vectors), ADR-0007 (expression IR — the eventual comparator authoring language),

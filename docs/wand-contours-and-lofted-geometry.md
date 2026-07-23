@@ -1,6 +1,19 @@
-# ADR-0021 — Field-derived geometry: wand contours to a lofted Swept
+# Field-derived geometry: wand contours to a lofted Swept
 
-Status: **draft / proposed** (2026-07-23) — written to be edited by what ADR-0019/0020 teach.
+Status: **design note** (2026-07-23)
+
+> Written as ADR-0021 and **demoted the same day** — see
+> [`decisions/README.md`](decisions/README.md) for why direction-setting documents are notes rather
+> than decision records here.
+>
+> Beyond that general reason, this one has a specific successor worth stating plainly: **TDA on cells
+> is likely a better feature-finder than a magic wand** — more reproducible, less operator-dependent,
+> and already half-built (`src/spatial/{persistence,sublevelsetPersistence}.ts`, the fuzzy-adjacency
+> ops in `src/gpu/spatial`). The wand was designed against a store that contains *only images*; once
+> fuller SpatialData objects with cells are available, the feature-finding half of this note should be
+> re-derived from that starting point rather than implemented as written. What survives either way is
+> everything downstream of the contour: the array-space storage, the human-authored correspondence,
+> the `Swept` extension, and the oblique-cut correction.
 
 ## Context
 
@@ -70,10 +83,10 @@ twice, which is why it is a first-class parameter rather than a safety valve.
 **Parameters, and why each exists:**
 
 - **`comparator` + `reference`** — the metric and the picked sample it is measured against
-  (ADR-0020's registry). Not RGB similarity: the wand must be stable across six differently-stained
-  slides, because that is where correspondence lives.
+  (the [stain-space note](stain-space-and-stack-transparency.md)'s registry). Not RGB similarity: the
+  wand must be stable across six differently-stained slides, because that is where correspondence lives.
 - **`tolerance`** — a threshold on the distance field. Set by **click-and-drag** (drag distance sets
-  it live, with the ADR-0020 isoline visualising it), with a slider as fallback.
+  it live, with the stain-space note's isoline visualising it), with a slider as fallback.
 - **`maxRadius`** — flood fill *will* leak: a glomerulus connects to surrounding stroma through
   continuous tissue, and one weak boundary pixel lets the fill escape across the section. A radius
   cap converts a catastrophic failure into a visibly-clipped one the user can see and correct.
@@ -208,7 +221,7 @@ weak boundary pixel. It would also make the drag legible by annotating the toler
 merge points. Not built this pass: the existing implementation was written for KDE-scale grids and a
 2048² patch is 4 M cells, so its cost must be measured first (a 512² patch — ample for a glomerulus at
 level 2 — is 262 k cells, or persistence can run downsampled purely to choose `t`).
-**This is why `distanceField` is its own stage**: persistence and the ADR-0020 render mode both consume
+**This is why `distanceField` is its own stage**: persistence and the stain-space note's render mode both consume
 that field, and the factoring only exists if it is known up front.
 
 ## Why
@@ -218,7 +231,7 @@ that field, and the factoring only exists if it is known up front.
 - **It is honest about the sampling.** Human-authored correspondence is not a simplification here; at
   100 µm spacing it is the only defensible source of truth, and encoding it as data makes the
   judgement reviewable.
-- **It reuses rather than adds** — the label polarity (ADR-0015), the comparator registry (ADR-0020),
+- **It reuses rather than adds** — the label polarity (ADR-0015), the comparator registry (the [stain-space note](stain-space-and-stack-transparency.md)),
   `ParamSpec`s and `resolve` (ADR-0012), `Swept`'s tessellator and transform stack (ADR-0010). The
   only genuinely new vocabulary is Contour / Station / Tubule.
 - **The op decomposition is the deliverable**, not just the wand. Five composable stages over fields
@@ -234,7 +247,7 @@ that field, and the factoring only exists if it is known up front.
   the stack acts pointwise over the whole surface. Data-derived stations give genuine spatial
   granularity along `s` — arguably the first honest *feature regions* a Swept has had — but the
   analytic transforms above them still do not.
-- **Duplicated unmix maths.** The wand's CPU path re-implements ADR-0020's GPU unmix. Deliberate and
+- **Duplicated unmix maths.** The wand's CPU path re-implements the stain-space note's GPU unmix. Deliberate and
   pinned by a parity test, but it is a real invariant to maintain.
 - **`maxRadius` is in pixels at a fixed level.** It should probably be in µm, which means it depends on
   the element's scale — a small thing that will be wrong once before it is right.
@@ -251,7 +264,8 @@ that field, and the factoring only exists if it is known up front.
 - **[in-repo]** ADR-0012 (provenance / pick-to-feature — this is its field-space-address leg),
   ADR-0010 (procedural geometry as composable ops — the `Swept` kind being extended), ADR-0015
   (`FieldRole`/`LabelMeta` — the wand mask's home; the coordinate systems contours ride),
-  ADR-0019 (the scene, the sections, and the `pick()` that seeds the wand), ADR-0020 (derived stain
+  ADR-0019 (the scene, the sections, and the `pick()` that seeds the wand), the
+  [stain-space note](stain-space-and-stack-transparency.md) (derived stain
   channels, the comparator registry, the `distance` render mode and isoline), ADR-0014 (procedural
   geometry render contract — depth/picking the tubule participates in), ADR-0017 (readback
   discipline — one readback per wand), ADR-0003 (`"use gpu"` kernels — the per-stage port target).
