@@ -25,7 +25,7 @@ deliberately did not build:
 > came from). The `resolve` surface is deliberately kind-agnostic so this slots in additively; the
 > *token* differs, the *resolver shape* does not. Designed-for, not built."
 
-This ADR builds that leg, on the serial-section stack of ADR-0019: **magic-wand a feature on a
+This ADR builds that leg, on the serial-section stack of the [scene note](serial-section-alignment-and-multi-viewport.md): **magic-wand a feature on a
 section, correspond it across sections by hand, and loft the result into a tube.** ADR-0015 likewise
 anticipated the destination — the wand mask is precisely the `label` field whose polarity and
 invariants it landed (`FieldRole`/`LabelMeta`, `src/gpu/graph/handle.ts:108`).
@@ -264,7 +264,7 @@ that field, and the factoring only exists if it is known up front.
 - **[in-repo]** ADR-0012 (provenance / pick-to-feature — this is its field-space-address leg),
   ADR-0010 (procedural geometry as composable ops — the `Swept` kind being extended), ADR-0015
   (`FieldRole`/`LabelMeta` — the wand mask's home; the coordinate systems contours ride),
-  ADR-0019 (the scene, the sections, and the `pick()` that seeds the wand), the
+  the [scene note](serial-section-alignment-and-multi-viewport.md) (the scene, the sections, and the `pick()` that seeds the wand), the
   [stain-space note](stain-space-and-stack-transparency.md) (derived stain
   channels, the comparator registry, the `distance` render mode and isoline), ADR-0014 (procedural
   geometry render contract — depth/picking the tubule participates in), ADR-0017 (readback

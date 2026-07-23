@@ -1,6 +1,30 @@
-# ADR-0019 — Serial-section alignment: coordinate systems, scene document, and multi-viewport residency
+# Serial-section alignment: coordinate systems, scene document, and multi-viewport residency
 
-Status: **proposed** (2026-07-23)
+Status: **design note** (2026-07-23)
+
+> Written as ADR-0019 and **demoted the same day**, by the rule in
+> [`decisions/README.md`](decisions/README.md): an ADR is for work in flight, and this is not. The
+> serial-section editor sits behind the package surface, the viewer-layer promotion, the
+> SpatialData→ops bridge, and the deck.gl interleaving spike. "Parts of it will be reused" is not the
+> test — applying the rule to the ADR that prompted writing the rule is the case that decides whether
+> the rule is real.
+>
+> Numbers 0019–0021 are all retired rather than reused, so commit history keeps pointing at something
+> real. The next ADR is 0022.
+>
+> **Two sections outlive the application they were written for**, and are the reason to keep reading
+> this note even if the serial-section editor is never built:
+>
+> - **§4, the camera state model.** `{pivot, orientation, distance}` with constraints as projections
+>   rather than accumulator clamps. It is API-agnostic, which makes it the natural shared camera
+>   representation for three ⇄ deck interleaving
+>   ([packaging note](packaging-and-consumers.md)).
+> - **§7, the measured R3F + WebGPU findings.** Including the `WebGPURenderer` scissor/viewport Y-flip
+>   and the fact that TSL node graphs do not hot-swap. These were *measured*, and this is now their
+>   durable home — the spike page that produced them is disposable.
+>
+> §6 (residency over the union of viewport selections) and §5 (one `pick()`) are the other parts most
+> likely to be lifted when the viewer layer is promoted out of `playground/`.
 
 ## Context
 
@@ -8,7 +32,7 @@ The multi-image scene editor (`playground/src/datasource/multiImageScene.ts`, AD
 1b) puts N SpatialData images in one WebGPU scene with a per-image gizmo. It was built for
 *co-registration* — two modalities of the same slide. The next application is different in kind:
 **serial sections of one specimen, hand-aligned into a 3-D stack**, so that features can be picked
-per section and lofted into geometry (the [wand note](../wand-contours-and-lofted-geometry.md)).
+per section and lofted into geometry (the [wand note](wand-contours-and-lofted-geometry.md)).
 
 ### The data this is designed against
 
@@ -86,7 +110,7 @@ Three sub-decisions, each with a reason that is not aesthetic:
 ### 2. Two persisted objects, split by failure mode
 
 - **`SceneDocument`** — the data: per-image `ImageAlignment`, channel/stain settings, and — if the
-  [wand note](../wand-contours-and-lofted-geometry.md) is ever built — contours and tubules.
+  [wand note](wand-contours-and-lofted-geometry.md) is ever built — contours and tubules.
   **Speaks NGFF natively**: transformations are serialised in the
   `coordinateTransformations` vocabulary the store already uses, contours as polygon geometry. Strict
   validation; a parse failure is surfaced, never swallowed.
@@ -164,7 +188,7 @@ quaternion fix is portable back to psychogeo as separate work.
 pick(viewport, px, py) → { worldPoint, imageId, arrayXY, geometryHit? } | null
 ```
 
-`worldPoint` serves the camera pivot; `imageId + arrayXY` serves the wand (the [wand note](../wand-contours-and-lofted-geometry.md)), image
+`worldPoint` serves the camera pivot; `imageId + arrayXY` serves the wand (the [wand note](wand-contours-and-lofted-geometry.md)), image
 selection, and the hover readout; `geometryHit` serves ADR-0012 `resolve`. One raycast, one
 world→array inverse (the effective matrix already exists), one place that understands
 viewport-local coordinates. Camera work can land first using only `worldPoint`.
@@ -253,12 +277,12 @@ per-section warping beyond a single affine; orthographic `select()`; the depth-b
   `src/datasource` change and the selector is a one-system special case until then.
 - **Eviction fights coarse-tile retention.** A culled-but-resident coarse tile is exactly what you
   want to keep (it is the fallback when you zoom out) and exactly what a naive evictor drops first.
-  This interacts with the [stain-space note](../stain-space-and-stack-transparency.md)'s coarse-tile culling and is the fiddliest part of the budget work.
+  This interacts with the [stain-space note](stain-space-and-stack-transparency.md)'s coarse-tile culling and is the fiddliest part of the budget work.
 - **Procedural tile deformation would break raycast picking.** Warping tiles — which is what
   non-rigid section registration eventually wants — invalidates the flat `pickPlane` raycast. The
   `pick()` signature is the seam; the implementation would move to depth-unprojection or a GPU
   picking pass, which is ADR-0012's answer anyway. It also interacts badly with plane-splitting
-  (the [stain-space note](../stain-space-and-stack-transparency.md)).
+  (the [stain-space note](stain-space-and-stack-transparency.md)).
 - **Uncapped viewports are a deliberate experiment.** Each costs a scene traversal and a render pass
   and widens the union. If the honest answer turns out to be "cap at 4", the budget work is what will
   tell us.

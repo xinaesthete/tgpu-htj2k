@@ -89,7 +89,7 @@ So the hard part is **not** device sharing. It is deck's side of the render pass
 **Two of those are unusually favourable for us.** The ported layer set is very nearly exactly what
 spatial-data work wants: cells as `ScatterplotLayer`/`PointCloudLayer`, boundaries as `PathLayer`.
 And the missing piece we would feel first — picking — is something this repo is building anyway
-(ADR-0019 §5's `pick()`), over data we own rather than over deck's layer state.
+(the [scene note](serial-section-alignment-and-multi-viewport.md) §5's `pick()`), over data we own rather than over deck's layer state.
 
 **The concrete asks, if we contribute upstream.** Shared-framebuffer interleaving needs deck to,
 on WebGPU:

@@ -15,7 +15,7 @@ Status: **design note** (2026-07-23)
 
 ## Context
 
-ADR-0019 stacks six H&E serial sections in one 3-D scene. Two things follow immediately, and they
+The [scene note](serial-section-alignment-and-multi-viewport.md) stacks six H&E serial sections in one 3-D scene. Two things follow immediately, and they
 turn out to be the same problem.
 
 **Transparency.** An H&E slide is mostly white background. Six opaque near-parallel planes stacked
@@ -137,7 +137,7 @@ onion-skinning: active section at full strength, immediate neighbours ghosted in
 the rest hidden. It reuses per-image opacity, blend mode, and the new alpha — nearly free.
 
 This is the aid that answers the actual question ("is *this* section aligned to its neighbour"). The
-world grid of ADR-0019 tells you where the axes are, which is a different and lesser question; it
+world grid of the [scene note](serial-section-alignment-and-multi-viewport.md) tells you where the axes are, which is a different and lesser question; it
 stays as a simple toggle.
 
 ### 5. Comparators are an **open registry** of CPU/WGSL twins
@@ -219,7 +219,7 @@ comparators authored as ADR-0007 expressions.
 
 - **Coarse-tile culling has blast radius.** `TileRenderer` is shared with `dualView` and
   `spatialvolume`. The change is a strict improvement (exactness + less overdraw) but it is not
-  contained to the new page, and it interacts with ADR-0019's eviction: a culled-but-resident coarse
+  contained to the new page, and it interacts with the scene note's eviction: a culled-but-resident coarse
   tile is the zoom-out fallback and must not be evicted first.
 - **Stain vectors are unmeasured.** Ruifrok–Johnston's published H&E vectors are a starting point;
   real slides differ. Identity default plus manual entry is the honest first step; estimating the
@@ -236,7 +236,7 @@ comparators authored as ADR-0007 expressions.
 
 ## References
 
-- **[in-repo]** ADR-0019 (the scene this serves), the
+- **[in-repo]** the [scene note](serial-section-alignment-and-multi-viewport.md) (the scene this serves), the
   [wand note](wand-contours-and-lofted-geometry.md) (the wand that consumes the derived
   channels and the comparators), ADR-0009 (rendering as ops — B is a way-station to C), ADR-0015
   (channel axis, `omero` channel entries, label polarity), ADR-0004 (element ⊥ axes — why comparators

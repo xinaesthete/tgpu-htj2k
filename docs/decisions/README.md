@@ -21,10 +21,20 @@ So:
   implied, nothing owed. `fuzzy-tda-and-windowing.md` and `gpu-spatial-analysis-toolbox.md` are the
   models. A note is *promoted* to an ADR the day someone starts implementing it.
 
-Two documents were demoted under this rule on the day it was written
-([stain space](../stain-space-and-stack-transparency.md),
-[wand contours](../wand-contours-and-lofted-geometry.md)) — numbers 0020 and 0021 are retired rather
-than reused, so commit history keeps pointing at something real.
+**Three documents were demoted under this rule on the day it was written** — the
+[scene note](../serial-section-alignment-and-multi-viewport.md),
+[stain space](../stain-space-and-stack-transparency.md), and
+[wand contours](../wand-contours-and-lofted-geometry.md), formerly ADRs 0019–0021.
+
+The third demotion is the one that matters. 0019 was written as a decision record for work we
+intended to start immediately, and then the priorities changed underneath it: the serial-section
+editor now sits behind the package surface, the viewer-layer promotion, the SpatialData→ops bridge,
+and the deck.gl spike. Keeping it as an ADR because it was *nearly* started is exactly how the pile
+accumulated in the first place. **A record earns the ADR form by being built, not by having been
+believed in.**
+
+Numbers 0019–0021 are **retired, not reused**, so commit history keeps pointing at something real.
+**The next ADR is 0022.**
 
 ## Status
 
@@ -52,20 +62,20 @@ than reused, so commit history keeps pointing at something real.
 | [0016](0016-topact-box-vs-kde-reproduce-then-improve.md) | TopACT: reproduce then improve | draft | **open** | no code |
 | [0017](0017-tier2-resident-buffer-edges.md) | Tier-2 resident buffer edges | accepted | **partial** | stages 1–3 + invariant 5 landed; 4–5 remain |
 | [0018](0018-field-domains-placement-and-resolution.md) | Field domains: extent, placement, resolution | draft | **open** | no `extent`/`placement` on `FieldValue` |
-| [0019](0019-serial-section-alignment-and-multi-viewport.md) | Serial-section alignment + multi-viewport | proposed | **open** | slice 0 (React 19 + R3F/WebGPU spike) landed; slice 1 not started |
 
 ⚠ **Two ADRs share the number 0010** (`procedural-geometry-composable-ops` and
 `spatialdata-js-as-loader-source`). Renumbering breaks inbound links in `docs/gpu-resource-sync.md`
 and across the ADRs themselves, so it has been left alone and is recorded here instead. Refer to them
 as *ADR-0010-geometry* and *ADR-0010-loader*.
 
-Roughly **8 landed, 6 partial, 6 open**.
+Roughly **8 landed, 6 partial, 5 open** across 19 records. No ADR has been added since the audit —
+deliberately. The three documents written on audit day all became design notes.
 
 ## Notable gaps worth knowing before planning
 
 - **`ResolvedPlacement` (0015 §3) never landed.** `src/datasource/types.ts` still carries a single
   `worldFromArray`. Anything wanting multiple named coordinate systems — a viewer with a system
-  selector, ADR-0019's `aligned` — needs it, and it is a small, well-specified change.
+  selector, the scene note's `aligned` — needs it, and it is a small, well-specified change.
 - **There are two expression systems** (0007). `src/geometry/expr.ts` builds `(s, θ)` expressions for
   procedural geometry; `src/gpu/graph` is a separate DAG. The claimed duality is aspirational.
 - **The value lattice is half-built** (0004/0005/0006/0018): element algebra and `axes` are real;
