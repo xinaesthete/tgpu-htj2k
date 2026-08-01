@@ -43,34 +43,51 @@ function makePx(n: number) {
   return px;
 }
 
-// CPU vs GPU inverse 5/3 DWT. Buffer pooling (reuse across calls) keeps Dawn
-// stable; large-size GPU timing uses the *no-readback* path — the realistic
-// keep-on-GPU viz case, and the only one that survives Dawn-on-Node at large
-// sizes (the mapAsync readback, not the compute, is what crashes there). CPU is
-// the full `idwt53_cpu`.
+// CPU vs GPU inverse 5/3 DWT, keep-on-GPU (no readback) — the viz case.
+//
+// This file used to say the no-readback path was "the only one that survives
+// Dawn-on-Node at large sizes (the mapAsync readback, not the compute, is what
+// crashes there)". That was **our own bug**: src/gpu/device.ts let Dawn's
+// Instance be GC'd out from under a live device, and allocation is what triggers
+// collection, so a large staging buffer was an ideal trigger. Fixed 2026-07-29,
+// and readback now runs clean to at least 4096²/67 MB — so each size below
+// verifies its readback against the CPU result, which also stops a fast timing
+// from being a silently empty buffer.
+//
+// Readback is *timed* in `pnpm bench:readback`, not here: inside the vitest fork
+// mapAsync completion is only observed on a coarse tick, so every size from 128²
+// to 1024² reports a flat ~125 ms — a fixed wait, not bandwidth. Same code as a
+// plain process scales properly with the data.
 //
 // Opt-in (BENCH=1): benchmarks are timing-noisy and the heavy GPU work
-// accumulates in the reused fork process alongside the other GPU tests, which
-// destabilises Dawn-on-Node. Run on demand: `pnpm bench:gpu`.
+// accumulates in the reused fork process alongside the other GPU tests. Run on
+// demand: `pnpm bench:gpu`.
 test.runIf(!!process.env.BENCH)("benchmark: inverse 5/3 DWT, CPU vs GPU (pooled, keep-on-GPU)", async () => {
   await ensure();
 
-  // Pure timing (no readback). Correctness of the GPU DWT is covered by
-  // gpu_idwt53.gpu.test.ts; mixing a full-buffer readback in here and then
-  // growing the pool destabilises Dawn-on-Node. Largest size first so the
-  // buffer pool is sized once and reused (repeated grow/destroy is the churn).
   process.stdout.write(`\n  size   | CPU DWT | GPU compute | speedup\n  -------+---------+-------------+--------\n`);
-  // Largest size first so the buffer pool is sized once and reused. The
-  // shared-memory kernel keeps GPU memory low enough (no global scratch) to run
-  // the no-readback compute path up to 1024² here.
+  // Largest size first so the buffer pool is sized once and reused (repeated
+  // grow/destroy is the churn).
   const rows: string[] = [];
-  for (const n of [1024, 512, 256, 128]) {
+  for (const n of [2048, 1024, 512, 256, 128]) {
     const cs = await encode({ data: makePx(n), width: n, height: n, components: 1, reversible: true, decompositions: 5 });
     const inp = decode_dwt_input_53(cs);
     const desc = inp.descriptor,
       coeffs = inp.coeffs;
     const gpuInput = { descriptor: desc, coeffs, width: inp.width, height: inp.height };
     const reps = n >= 512 ? 5 : 10;
+
+    // Check the readback path against the CPU once per size, so a fast number
+    // here can never turn out to be a silently empty buffer.
+    const ref = idwt53_cpu(desc, coeffs);
+    const got = await idwt53Gpu(gpuInput, { readback: true });
+    if (!got || got.length !== ref.length) {
+      throw new Error(`${n}²: readback returned ${got?.length ?? "null"}, want ${ref.length}`);
+    }
+    for (let i = 0; i < ref.length; i++) {
+      if (got[i] !== ref[i]) throw new Error(`${n}²: readback mismatch at ${i}: ${got[i]} !== ${ref[i]}`);
+    }
+
     const tCpu = timeS(reps, 2, () => idwt53_cpu(desc, coeffs));
     const tGpu = await timeA(reps, 3, () => idwt53Gpu(gpuInput, { readback: false }));
     rows.push(
@@ -80,6 +97,7 @@ test.runIf(!!process.env.BENCH)("benchmark: inverse 5/3 DWT, CPU vs GPU (pooled,
   for (const r of rows.reverse()) process.stdout.write(`${r}\n`);
   process.stdout.write(
     `\n  Medians, ms. GPU = compute only (upload + dispatch + sync, result stays on\n` +
-      `  GPU); CPU = full inverse DWT into CPU memory. Buffers are pooled/reused.\n`,
+      `  GPU); CPU = full inverse DWT into CPU memory. Buffers are pooled/reused.\n` +
+      `  Readback is verified here but timed in \`pnpm bench:readback\`.\n`,
   );
 });
